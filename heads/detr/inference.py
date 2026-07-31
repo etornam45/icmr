@@ -124,9 +124,9 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
 
     detr_decoder = build_detr(
         d_model=384,
-        num_layers=3,
+        num_layers=4,
         n_classes=92,
-        n_points=4,
+        n_points=5,
     ).to(device)
     detr_decoder.load_state_dict(
         torch.load(
@@ -180,7 +180,7 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
             x,
             y,
             f"{class_name}: {score:.2f}",
-            bbox=dict(facecolor="red", alpha=0.5),
+            bbox={"facecolor": "red", "alpha": 0.5},
             fontsize=8,
             color="white",
         )
@@ -192,4 +192,4 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
 
 
 if __name__ == "__main__":
-    run_inference()
+    run_inference(image_path="1900-151662242_tiny.jpg")
