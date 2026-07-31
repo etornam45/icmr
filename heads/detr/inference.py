@@ -159,7 +159,7 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
     boxes = boxes[keep].cpu().numpy()
 
     img_size = 224
-    fig, ax = plt.subplots(1, figsize=(8, 8))
+    _fig, ax = plt.subplots(1, figsize=(8, 8))
     ax.imshow(img_arr)
 
     for score, label, (cx, cy, w, h) in zip(scores, labels, boxes):
