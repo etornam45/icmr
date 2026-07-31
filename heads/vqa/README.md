@@ -195,6 +195,18 @@ python -m heads.vqa.train \
   --epochs 5
 ```
 
+Log epoch losses and eval samples to SQLite:
+
+```bash
+python -m heads.vqa.train \
+  --skip-missing-videos \
+  --log-db logs/vqa.db \
+  --run-name cuva-baseline \
+  --epochs 5
+```
+
+See [`logger/README.md`](../../logger/README.md) for the schema and SQL queries.
+
 Checkpoints are saved under
 `dinov3/checkpoints/model/vqa_cuva_minicpm/`, with the best eval checkpoint
 under `vqa_cuva_minicpm_best/`.
