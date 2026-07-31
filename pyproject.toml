@@ -1,7 +1,7 @@
 [project]
 name = "dinov3"
 version = "0.1.0"
-description = "PyTorch DINOv3 with DETR detection and DINOv3+MiniCPM VQA heads"
+description = "PyTorch DINOv3 with DETR detection and DINOv3+MiniCPM video VQA heads"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,6 +16,8 @@ dependencies = [
     "pyyaml",
     "safetensors",
     "datasets",
+    "huggingface_hub",
+    "opencv-python",
     "nltk",
     "peft",
     "accelerate",

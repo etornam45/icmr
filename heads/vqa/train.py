@@ -6,9 +6,10 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from dinov3.utils.device import get_device
-from heads.vqa.dataset import encode_user_prompt, make_dataloader
+from heads.vqa.dataset import DEFAULT_CACHE_DIR, encode_user_prompt, make_dataloader
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_NUM_FRAMES,
     adapter_trainable_params,
     build_hybrid_model,
     decode_generated_answer,
@@ -21,9 +22,39 @@ DEFAULT_CHECKPOINT = DEFAULT_CHECKPOINT_DIR
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train DINOv3 + MiniCPM5-1B VQA hybrid")
+    parser = argparse.ArgumentParser(
+        description="Train DINOv3 CLS + MiniCPM5-1B video VQA hybrid"
+    )
+    parser.add_argument(
+        "--video-root",
+        type=str,
+        default=None,
+        help="Extracted CUVA video directory (default: <cache-dir>/videos)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=DEFAULT_CACHE_DIR,
+        help="Local cache for CUVA parquet files and video archives",
+    )
+    parser.add_argument(
+        "--download-videos",
+        action="store_true",
+        help="Download and extract CUVA video archives before training (~25.6 GB)",
+    )
+    parser.add_argument(
+        "--tasks",
+        default=None,
+        help="Comma-separated task filter, e.g. Classification,Cause,Result",
+    )
+    parser.add_argument(
+        "--skip-missing-videos",
+        action="store_true",
+        help="Train/evaluate only rows whose CUVA videos exist under video-root",
+    )
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument("--llm-lr", type=float, default=2e-4, help="LoRA learning rate")
     parser.add_argument(
         "--adapter-lr", type=float, default=1e-4, help="Vision adapter learning rate"
@@ -46,13 +77,13 @@ def train_epoch(model, loader, optimizer, device):
 
     pbar = tqdm(loader, desc="Training", leave=False)
     for batch in pbar:
-        images = batch["image"].to(device)
+        videos = batch["video"].to(device)
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
         optimizer.zero_grad()
-        outputs = model(images, input_ids, attention_mask, labels=labels)
+        outputs = model(videos, input_ids, attention_mask, labels=labels)
         loss = outputs.loss
         if not torch.isfinite(loss):
             print("Warning: non-finite loss, skipping batch")
@@ -78,26 +109,31 @@ def evaluate(model, loader, tokenizer, device, max_gen_samples: int = 8):
     hypotheses = []
 
     for batch in tqdm(loader, desc="Evaluating", leave=False):
-        images = batch["image"].to(device)
+        videos = batch["video"].to(device)
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
-        outputs = model(images, input_ids, attention_mask, labels=labels)
+        outputs = model(videos, input_ids, attention_mask, labels=labels)
         total_loss += outputs.loss.item()
 
         if len(references) < max_gen_samples:
             prompt = encode_user_prompt(tokenizer, [batch["question"][0]], device)
             prompt_len = prompt["input_ids"].shape[1]
             gen_ids = model.generate(
-                images[:1],
+                videos[:1],
                 prompt["input_ids"][:1],
                 attention_mask=prompt["attention_mask"][:1],
                 max_new_tokens=128,
                 num_beams=1,
             )
             hypotheses.append(
-                decode_generated_answer(tokenizer, gen_ids, prompt_len)
+                decode_generated_answer(
+                    tokenizer,
+                    gen_ids,
+                    prompt_len,
+                    num_visual_tokens=model.num_visual_tokens,
+                )
             )
             references.append(batch["answer"][0])
 
@@ -112,6 +148,7 @@ def main():
 
     model, tokenizer = build_hybrid_model(
         device,
+        num_frames=args.num_frames,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
@@ -122,9 +159,21 @@ def main():
     if hasattr(model.llm, "gradient_checkpointing_enable"):
         model.llm.gradient_checkpointing_enable()
 
+    tasks = (
+        [value.strip() for value in args.tasks.split(",") if value.strip()]
+        if args.tasks
+        else None
+    )
+
     train_loader, _ = make_dataloader(
         tokenizer,
+        video_root=args.video_root,
         split="train",
+        cache_dir=args.cache_dir,
+        download_videos=args.download_videos,
+        tasks=tasks,
+        skip_missing=args.skip_missing_videos,
+        num_frames=args.num_frames,
         max_length=args.max_length,
         batch_size=args.batch_size,
         shuffle=True,
@@ -156,7 +205,13 @@ def main():
 
         test_loader, _ = make_dataloader(
             tokenizer,
+            video_root=args.video_root,
             split="test",
+            cache_dir=args.cache_dir,
+            download_videos=False,
+            tasks=tasks,
+            skip_missing=args.skip_missing_videos,
+            num_frames=args.num_frames,
             max_length=args.max_length,
             batch_size=args.batch_size,
             shuffle=False,
