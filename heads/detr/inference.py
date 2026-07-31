@@ -1,9 +1,9 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from matplotlib import patches
 from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 
 from dinov3.checkpoints.load import load_checkpoint
 from dinov3.models import vit_small
