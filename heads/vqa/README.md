@@ -1,18 +1,29 @@
-# DINOv3 + MiniCPM5-1B CUVA Video QA
+# DINOv3 + MiniCPM5-1B Video VQA / Captioning
 
-Video question answering on
-[fesvhtr/CUVA](https://huggingface.co/datasets/fesvhtr/CUVA):
+Supports two datasets:
+
+1. **CUVA** ([fesvhtr/CUVA](https://huggingface.co/datasets/fesvhtr/CUVA)) —
+   video question answering (question + answer)
+2. **VAU-Bench** ([7xiang/VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench)) —
+   video-only Description captioning (no dataset question)
+
+Architecture:
 
 - **Vision**: frozen DINOv3 ViT-S CLS token for each sampled frame
 - **Adapter**: linear 384 → 1536, LayerNorm, and 1D temporal position encoding
 - **Language**: LoRA-tuned
   [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B)
-- **Tasks**: Detection, Classification, Cause, Result, Timestamp, and Description
 
-Each of the 16 uniformly sampled frames becomes one ordered MiniCPM visual
-prefix token. Existing image-VQA checkpoints are incompatible.
+Each uniformly sampled frame becomes one ordered MiniCPM visual prefix token.
+Existing image-VQA checkpoints are incompatible.
 
-## Dataset
+---
+
+## CUVA Video QA
+
+CUVA tasks: Detection, Classification, Cause, Result, Timestamp, and Description.
+
+### Dataset
 
 CUVA provides annotations and original videos in the same Hugging Face
 repository. Its schema is:
@@ -35,9 +46,9 @@ The dataset is about 25.6 GB. CUVA is licensed
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/);
 commercial use is not permitted and derivatives must use the same license.
 
-## Download
+### Download
 
-### Recommended: project helper
+#### Recommended: project helper
 
 Download annotations only (small parquet files):
 
@@ -72,7 +83,7 @@ python -m heads.vqa.train \
   --epochs 5
 ```
 
-delete 
+Delete archives after extraction if needed:
 
 ```bash
 rm data/CUVA/raw/group_{0,1,2,3}.zip
@@ -99,7 +110,7 @@ data/CUVA/
 Keep enough free space for both the archives and extracted videos. Delete the
 ZIP files after successful extraction if you need to reclaim space.
 
-### Direct Hugging Face download
+#### Direct Hugging Face download
 
 Download a single archive:
 
@@ -137,7 +148,7 @@ for archive in data/CUVA/raw/group_*.zip; do
 done
 ```
 
-## Inspect annotations
+### Inspect annotations
 
 No video download is required:
 
@@ -158,12 +169,11 @@ samples = load_cuva_samples(
 )
 ```
 
-## Train
-
-If videos were downloaded with the project helper:
+### Train (CUVA)
 
 ```bash
 python -m heads.vqa.train \
+  --dataset cuva \
   --epochs 5 \
   --batch-size 2 \
   --num-frames 16 \
@@ -174,50 +184,23 @@ python -m heads.vqa.train \
 Download videos automatically before training:
 
 ```bash
-python -m heads.vqa.train --download-videos --epochs 5
-```
-
-Use already extracted videos elsewhere:
-
-```bash
-python -m heads.vqa.train \
-  --video-root /path/to/CUVA/videos \
-  --epochs 5
+python -m heads.vqa.train --dataset cuva --download-videos --epochs 5
 ```
 
 Train only selected tasks:
 
 ```bash
 python -m heads.vqa.train \
+  --dataset cuva \
   --tasks Classification,Cause,Result \
   --epochs 5
 ```
-
-Resume:
-
-```bash
-python -m heads.vqa.train \
-  --resume dinov3/checkpoints/model/vqa_cuva_minicpm \
-  --epochs 5
-```
-
-Log epoch losses and eval samples to SQLite:
-
-```bash
-python -m heads.vqa.train \
-  --skip-missing-videos \
-  --log-db logs/vqa.db \
-  --run-name cuva-baseline \
-  --epochs 5
-```
-
-See [`logger/README.md`](../../logger/README.md) for the schema and SQL queries.
 
 Checkpoints are saved under
 `dinov3/checkpoints/model/vqa_cuva_minicpm/`, with the best eval checkpoint
 under `vqa_cuva_minicpm_best/`.
 
-## Inference
+### Inference (CUVA)
 
 ```bash
 python -m heads.vqa.inference \
@@ -225,20 +208,134 @@ python -m heads.vqa.inference \
   --question "Please give a detailed description of the anomalous event."
 ```
 
+---
+
+## VAU-Bench Description
+
+Video-only captioning: the model does **not** use the VAU-Bench `Question` /
+options. A fixed prompt is used instead:
+
+> Describe the anomalous event in the video.
+
+Training targets the `Description` column. Frames are trimmed to
+`[Start Time, End Time]` when both values are ≥ 0; `-1` means use the full
+video. Duplicate QA rows for the same `Video Name` are collapsed to one sample.
+
+Anomaly Class classification uses the same videos via
+[`heads/anomaly`](../anomaly).
+
+### Dataset setup
+
+Annotations come from [7xiang/VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench).
+**UCF-Crime videos** come from Hugging Face
+[`etornam/ufc-crime-videos`](https://huggingface.co/datasets/etornam/ufc-crime-videos)
+(~105 GB). Training defaults to **UCF-only** (`--sources ucf`), which covers
+about 1194 train / 299 validation videos. MSAD / ECVA are optional and not
+downloaded by the helpers below.
+
+Original UCF citation:
+[UCF-Crime project page](https://www.crcv.ucf.edu/projects/real-world/).
+
+```bash
+# 1. Download annotations
+python -m heads.vqa.vau_dataset --annotations-only --split train
+python -m heads.vqa.vau_dataset --annotations-only --split validation
+
+# 2. Download UCF videos from HF and stage as ucf_* under data/VAU-Bench/videos/
+python -m heads.vqa.vau_dataset --download-ucf
+# If already downloaded to data/UCF-Crime/hf:
+# python -m heads.vqa.vau_dataset --download-ucf --stage-only
+
+# 3. Verify UCF coverage
+python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split train
+python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split validation
+```
+
+Expected layout:
+
+```text
+data/UCF-Crime/hf/           # HF snapshot (~105 GB)
+  Anomaly-Videos-Part-1/...
+  Training-Normal-Videos-Part-1/...
+data/VAU-Bench/
+  hf_cache/                  # VAU annotations
+  videos/
+    ucf_Abuse001_x264.mp4    # staged (symlink or copy)
+```
+
+Use `--copy` with `--download-ucf` if the destination must be self-contained
+instead of symlinks. Optional legacy staging from a local extract:
+
+```bash
+python -m heads.vqa.vau_dataset --stage-ucf /path/to/extracted/ucf
+```
+
+### Train (VAU Description)
+
+Defaults to UCF-only when `--dataset vau`:
+
+```bash
+python -m heads.vqa.train \
+  --dataset vau \
+  --sources ucf \
+  --skip-missing-videos \
+  --epochs 5 \
+  --batch-size 2 \
+  --num-frames 16
+```
+
+Checkpoints default to `dinov3/checkpoints/model/vqa_vau_minicpm/`.
+
+### Inference (VAU Description)
+
+```bash
+python -m heads.vqa.inference \
+  --video data/VAU-Bench/videos/ucf_Abuse001_x264.mp4 \
+  --no-question \
+  --checkpoint dinov3/checkpoints/model/vqa_vau_minicpm \
+  --start-sec 23 \
+  --end-sec 31
+```
+
+Omitting `--question` (or passing `--no-question`) uses the fixed caption
+prompt. Optional `--start-sec` / `--end-sec` trim frame sampling to the
+annotated anomaly window.
+
 ```python
 from heads.vqa.inference import run_inference
 
 answer = run_inference(
-    video_path="data/CUVA/videos/path/to/00001.mp4",
-    question="What caused the anomalous event?",
+    video_path="data/VAU-Bench/videos/ucf_Abuse001_x264.mp4",
+    question=None,  # uses fixed caption prompt
+    checkpoint_dir="dinov3/checkpoints/model/vqa_vau_minicpm",
+    start_sec=23,
+    end_sec=31,
 )
 ```
+
+---
+
+## Logging
+
+Log epoch losses and eval samples to SQLite:
+
+```bash
+python -m heads.vqa.train \
+  --dataset vau \
+  --skip-missing-videos \
+  --log-db logs/vqa.db \
+  --run-name vau-description \
+  --epochs 5
+```
+
+See [`logger/README.md`](../../logger/README.md) for the schema and SQL queries.
 
 ## Checks
 
 ```bash
 python -m py_compile \
   heads/vqa/dataset.py \
+  heads/vqa/vau_dataset.py \
   heads/vqa/model.py \
   heads/vqa/train.py \
   heads/vqa/inference.py

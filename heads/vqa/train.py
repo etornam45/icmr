@@ -6,7 +6,11 @@ from torch import optim
 from tqdm import tqdm
 
 from dinov3.utils.device import get_device
-from heads.vqa.dataset import DEFAULT_CACHE_DIR, encode_user_prompt, make_dataloader
+from heads.vqa.dataset import (
+    DEFAULT_CACHE_DIR as CUVA_CACHE_DIR,
+    encode_user_prompt,
+    make_dataloader,
+)
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_NUM_FRAMES,
@@ -17,26 +21,38 @@ from heads.vqa.model import (
     save_hybrid_checkpoint,
     vision_adapter_params,
 )
+from heads.vqa.vau_dataset import (
+    CAPTION_PROMPT,
+    DEFAULT_CACHE_DIR as VAU_CACHE_DIR,
+    make_vau_caption_dataloader,
+)
 from logger import SQLiteLogger
 
 DEFAULT_CHECKPOINT = DEFAULT_CHECKPOINT_DIR
+VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_minicpm"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train DINOv3 CLS + MiniCPM5-1B video VQA hybrid"
+        description="Train DINOv3 CLS + MiniCPM5-1B video VQA / captioning hybrid"
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=("cuva", "vau"),
+        default="cuva",
+        help="cuva: CUVA video QA; vau: VAU-Bench video-only Description",
     )
     parser.add_argument(
         "--video-root",
         type=str,
         default=None,
-        help="Extracted CUVA video directory (default: <cache-dir>/videos)",
+        help="Video directory (default: <cache-dir>/videos)",
     )
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default=DEFAULT_CACHE_DIR,
-        help="Local cache for CUVA parquet files and video archives",
+        default=None,
+        help="Annotation cache dir (default: data/CUVA or data/VAU-Bench)",
     )
     parser.add_argument(
         "--download-videos",
@@ -46,12 +62,26 @@ def parse_args():
     parser.add_argument(
         "--tasks",
         default=None,
-        help="Comma-separated task filter, e.g. Classification,Cause,Result",
+        help="Comma-separated CUVA task filter, e.g. Classification,Cause,Result",
     )
     parser.add_argument(
         "--skip-missing-videos",
         action="store_true",
-        help="Train/evaluate only rows whose CUVA videos exist under video-root",
+        help="Train/evaluate only rows whose videos exist under video-root",
+    )
+    parser.add_argument(
+        "--sources",
+        type=str,
+        default=None,
+        help=(
+            "VAU only: comma-separated source filter (ucf, msad, ecva). "
+            "Default for --dataset vau is ucf"
+        ),
+    )
+    parser.add_argument(
+        "--eval-split",
+        default=None,
+        help="Eval split (default: test for cuva, validation for vau)",
     )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -65,7 +95,7 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--output", type=str, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument(
         "--log-db",
@@ -80,6 +110,64 @@ def parse_args():
         help="Optional name for the logged training run",
     )
     return parser.parse_args()
+
+
+def _resolve_defaults(args):
+    if args.cache_dir is None:
+        args.cache_dir = VAU_CACHE_DIR if args.dataset == "vau" else CUVA_CACHE_DIR
+    if args.output is None:
+        args.output = VAU_CHECKPOINT if args.dataset == "vau" else DEFAULT_CHECKPOINT
+    if args.eval_split is None:
+        args.eval_split = "validation" if args.dataset == "vau" else "test"
+    if args.dataset == "vau" and args.download_videos:
+        raise ValueError(
+            "--download-videos is only supported for --dataset cuva. "
+            "Download UCF videos with: python -m heads.vqa.vau_dataset --download-ucf"
+        )
+    if args.dataset == "vau" and args.tasks:
+        raise ValueError("--tasks is only supported for --dataset cuva")
+    if args.dataset == "cuva" and args.sources:
+        raise ValueError("--sources is only supported for --dataset vau")
+    if args.dataset == "vau" and args.sources is None:
+        args.sources = "ucf"
+    return args
+
+
+def _make_loader(args, tokenizer, split: str, shuffle: bool):
+    if args.dataset == "vau":
+        return make_vau_caption_dataloader(
+            tokenizer,
+            video_root=args.video_root,
+            split=split,
+            cache_dir=args.cache_dir,
+            skip_missing=args.skip_missing_videos,
+            num_frames=args.num_frames,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            num_workers=args.num_workers,
+            sources=args.sources,
+        )
+
+    tasks = (
+        [value.strip() for value in args.tasks.split(",") if value.strip()]
+        if args.tasks
+        else None
+    )
+    return make_dataloader(
+        tokenizer,
+        video_root=args.video_root,
+        split=split,
+        cache_dir=args.cache_dir,
+        download_videos=args.download_videos and split == "train",
+        tasks=tasks,
+        skip_missing=args.skip_missing_videos,
+        num_frames=args.num_frames,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.num_workers,
+    )
 
 
 def train_epoch(model, loader, optimizer, device):
@@ -157,9 +245,12 @@ def evaluate(model, loader, tokenizer, device, max_gen_samples: int = 8):
 
 
 def main():
-    args = parse_args()
+    args = _resolve_defaults(parse_args())
     device = get_device()
     print(f"Using device: {device}")
+    print(f"Dataset: {args.dataset}")
+    if args.dataset == "vau":
+        print(f"Caption prompt: {CAPTION_PROMPT!r}")
 
     model, tokenizer = build_hybrid_model(
         device,
@@ -174,26 +265,7 @@ def main():
     if hasattr(model.llm, "gradient_checkpointing_enable"):
         model.llm.gradient_checkpointing_enable()
 
-    tasks = (
-        [value.strip() for value in args.tasks.split(",") if value.strip()]
-        if args.tasks
-        else None
-    )
-
-    train_loader, _ = make_dataloader(
-        tokenizer,
-        video_root=args.video_root,
-        split="train",
-        cache_dir=args.cache_dir,
-        download_videos=args.download_videos,
-        tasks=tasks,
-        skip_missing=args.skip_missing_videos,
-        num_frames=args.num_frames,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-    )
+    train_loader, _ = _make_loader(args, tokenizer, split="train", shuffle=True)
     print(f"Train batches: {len(train_loader)}")
 
     optimizer = optim.AdamW(
@@ -229,24 +301,13 @@ def main():
         for epoch in range(args.epochs):
             train_loss = train_epoch(model, train_loader, optimizer, device)
 
-            test_loader, _ = make_dataloader(
-                tokenizer,
-                video_root=args.video_root,
-                split="test",
-                cache_dir=args.cache_dir,
-                download_videos=False,
-                tasks=tasks,
-                skip_missing=args.skip_missing_videos,
-                num_frames=args.num_frames,
-                max_length=args.max_length,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.num_workers,
+            eval_loader, _ = _make_loader(
+                args, tokenizer, split=args.eval_split, shuffle=False
             )
             eval_loss, questions, refs, hyps = evaluate(
-                model, test_loader, tokenizer, device
+                model, eval_loader, tokenizer, device
             )
-            del test_loader
+            del eval_loader
 
             print(
                 f"Epoch {epoch + 1}/{args.epochs}: "

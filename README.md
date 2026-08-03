@@ -1,6 +1,6 @@
 # PyTorch DINOv3
 
-A PyTorch implementation of **DINOv3** (Meta's self-supervised ViT models) with DETR object-detection and DINOv3+MiniCPM VQA heads. The backbone is vendored from Meta's [official DINOv3 repository](https://github.com/facebookresearch/dinov3).
+A PyTorch implementation of **DINOv3** (Meta's self-supervised ViT models) with DETR object-detection, DINOv3+MiniCPM VQA/captioning, and video anomaly classification heads. The backbone is vendored from Meta's [official DINOv3 repository](https://github.com/facebookresearch/dinov3).
 
 Supports CUDA, Apple Silicon (MPS), and CPU with automatic device detection.
 
@@ -11,7 +11,8 @@ Supports CUDA, Apple Silicon (MPS), and CPU with automatic device detection.
 - **Multiple Architectures**: `vit_small`, `vit_base`, `vit_large`, `vit_so400m`, `vit_huge2`, `vit_giant2`, `vit_7b`.
 - **Advanced Components**: RoPE, SwiGLU FFN, LayerScale, storage/register tokens.
 - **DETR Detection Head**: Trainable deformable-attention decoder on COCO using frozen DINOv3 patch tokens.
-- **VQA Head**: DINOv3 + MiniCPM5-1B hybrid (LoRA + vision adapter) for GhanaAgricVQA crop-disease question answering.
+- **VQA / Captioning Head**: DINOv3 + MiniCPM5-1B hybrid (LoRA + vision adapter) for CUVA video QA and VAU-Bench Description captioning.
+- **Anomaly Head**: DINOv3 temporal-pooled classifier for VAU-Bench `Anomaly Class`.
 
 ## Installation
 
@@ -67,16 +68,34 @@ python heads/detr/train.py
 python heads/detr/inference.py
 ```
 
-### 5. VQA Training (DINOv3 + MiniCPM5-1B)
+### 5. VQA Training (CUVA or VAU-Bench Description)
 
 ```bash
-python -m heads.vqa.train --epochs 5 --batch-size 4
+# CUVA video QA
+python -m heads.vqa.train --dataset cuva --epochs 5 --batch-size 4
+
+# VAU-Bench video-only Description (see heads/vqa/README.md for video setup)
+python -m heads.vqa.train --dataset vau --skip-missing-videos --epochs 5
 ```
 
 ### 6. VQA Inference
 
 ```bash
-python -m heads.vqa.inference
+python -m heads.vqa.inference --video path/to/video.mp4 --question "..."
+# or captioning:
+python -m heads.vqa.inference --video path/to/video.mp4 --no-question
+```
+
+### 7. Anomaly Class Training (VAU-Bench)
+
+```bash
+python -m heads.anomaly.train --skip-missing-videos --epochs 10
+```
+
+### 8. Anomaly Class Inference
+
+```bash
+python -m heads.anomaly.inference --video path/to/video.mp4
 ```
 
 ## Repository Structure
@@ -85,7 +104,8 @@ python -m heads.vqa.inference
 - `dinov3/layers/`: RoPE, SwiGLU, Attention, etc. (vendored from Meta).
 - `dinov3/checkpoints/`: Checkpoint loading utilities.
 - `heads/detr/`: DETR detection head, training, and inference.
-- `heads/vqa/`: DINOv3 + MiniCPM5-1B hybrid VQA head for GhanaAgricVQA.
+- `heads/vqa/`: DINOv3 + MiniCPM hybrid for CUVA VQA and VAU-Bench Description.
+- `heads/anomaly/`: DINOv3 classifier for VAU-Bench Anomaly Class.
 
 ## Acknowledgments
 

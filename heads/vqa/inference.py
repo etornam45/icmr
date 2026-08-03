@@ -15,16 +15,24 @@ from heads.vqa.model import (
     decode_generated_answer,
     load_hybrid_checkpoint,
 )
+from heads.vqa.vau_dataset import CAPTION_PROMPT
+
+VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_minicpm"
 
 
 def run_inference(
     video_path: str,
-    question: str,
+    question: str | None = None,
     max_new_tokens: int = 128,
     num_frames: int = DEFAULT_NUM_FRAMES,
     checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
 ) -> str:
     device = get_device()
+
+    if question is None:
+        question = CAPTION_PROMPT
 
     checkpoint_path = Path(checkpoint_dir)
     best_path = checkpoint_path.parent / f"{checkpoint_path.name}_best"
@@ -40,7 +48,11 @@ def run_inference(
     model.eval()
 
     frames = load_video_frames(
-        video_path, num_frames=num_frames, img_size=IMG_SIZE
+        video_path,
+        num_frames=num_frames,
+        img_size=IMG_SIZE,
+        start_sec=start_sec,
+        end_sec=end_sec,
     ).unsqueeze(0).to(device)
 
     prompt = encode_user_prompt(tokenizer, [question], device)
@@ -67,14 +79,37 @@ def run_inference(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Video VQA inference")
+    parser = argparse.ArgumentParser(description="Video VQA / captioning inference")
     parser.add_argument("--video", type=str, required=True, help="Path to video clip")
-    parser.add_argument("--question", type=str, required=True)
+    parser.add_argument(
+        "--question",
+        type=str,
+        default=None,
+        help="Optional question; defaults to the VAU caption prompt when omitted",
+    )
+    parser.add_argument(
+        "--no-question",
+        action="store_true",
+        help="Force the fixed VAU-Bench Description caption prompt",
+    )
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--start-sec",
+        type=float,
+        default=None,
+        help="Optional anomaly start time (seconds) for trim sampling",
+    )
+    parser.add_argument(
+        "--end-sec",
+        type=float,
+        default=None,
+        help="Optional anomaly end time (seconds) for trim sampling",
+    )
     args = parser.parse_args()
 
+    question = CAPTION_PROMPT if args.no_question else args.question
     checkpoint = Path(args.checkpoint)
     best = checkpoint.parent / f"{checkpoint.name}_best"
     if not checkpoint.exists() and not best.exists():
@@ -85,8 +120,10 @@ if __name__ == "__main__":
     else:
         run_inference(
             video_path=args.video,
-            question=args.question,
+            question=question,
             max_new_tokens=args.max_new_tokens,
             num_frames=args.num_frames,
             checkpoint_dir=args.checkpoint,
+            start_sec=args.start_sec,
+            end_sec=args.end_sec,
         )
