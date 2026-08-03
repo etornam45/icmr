@@ -22,7 +22,7 @@ VISION_DIM = 384
 LLM_DIM = 1536
 IMG_SIZE = 224
 PATCH_SIZE = 16
-DEFAULT_NUM_FRAMES = 16
+DEFAULT_NUM_FRAMES = 16 * 2
 
 
 def build_1d_sincos_pos_embed(num_positions: int, dim: int) -> torch.Tensor:
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     from heads.vqa.minicpm_loader import tokenize_chat_pair
 
     device = get_device()
-    num_frames = 8
+    num_frames = DEFAULT_NUM_FRAMES
     model, tokenizer = build_hybrid_model(device, num_frames=num_frames)
 
     videos = torch.randn(2, num_frames, 3, IMG_SIZE, IMG_SIZE, device=device)

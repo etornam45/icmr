@@ -72,6 +72,12 @@ python -m heads.vqa.train \
   --epochs 5
 ```
 
+delete 
+
+```bash
+rm data/CUVA/raw/group_{0,1,2,3}.zip
+```
+
 This uses every available video under `video-root`; evaluation is consequently
 performed only on the available subset as well.
 
