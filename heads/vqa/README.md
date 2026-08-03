@@ -229,9 +229,9 @@ Anomaly Class classification uses the same videos via
 Annotations come from [7xiang/VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench).
 **UCF-Crime videos** come from Hugging Face
 [`etornam/ufc-crime-videos`](https://huggingface.co/datasets/etornam/ufc-crime-videos)
-(~105 GB). Training defaults to **UCF-only** (`--sources ucf`), which covers
-about 1194 train / 299 validation videos. MSAD / ECVA are optional and not
-downloaded by the helpers below.
+(~105 GB full; ~57 GB with `--vau-only` for train+val). Training defaults to
+**UCF-only** (`--sources ucf`), which covers about 1194 train / 299 validation
+videos. MSAD / ECVA are optional and not downloaded by the helpers below.
 
 Original UCF citation:
 [UCF-Crime project page](https://www.crcv.ucf.edu/projects/real-world/).
@@ -241,8 +241,9 @@ Original UCF citation:
 python -m heads.vqa.vau_dataset --annotations-only --split train
 python -m heads.vqa.vau_dataset --annotations-only --split validation
 
-# 2. Download UCF videos from HF and stage as ucf_* under data/VAU-Bench/videos/
-python -m heads.vqa.vau_dataset --download-ucf
+# 2. Download only UCF videos named in VAU train+val (~57 GB) and stage as ucf_*
+python -m heads.vqa.vau_dataset --download-ucf --vau-only
+# Full mirror (~105 GB): omit --vau-only
 # If already downloaded to data/UCF-Crime/hf:
 # python -m heads.vqa.vau_dataset --download-ucf --stage-only
 
@@ -251,10 +252,16 @@ python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split train
 python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split validation
 ```
 
+Train with `--skip-missing-videos` so any files that fail to download are skipped:
+
+```bash
+python -m heads.vqa.train --dataset vau --sources ucf --skip-missing-videos --epochs 5
+```
+
 Expected layout:
 
 ```text
-data/UCF-Crime/hf/           # HF snapshot (~105 GB)
+data/UCF-Crime/hf/           # HF snapshot (~57 GB with --vau-only)
   Anomaly-Videos-Part-1/...
   Training-Normal-Videos-Part-1/...
 data/VAU-Bench/

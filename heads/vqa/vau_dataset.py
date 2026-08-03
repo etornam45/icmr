@@ -144,6 +144,78 @@ def ensure_vau_annotations(cache_dir: str | Path = DEFAULT_CACHE_DIR) -> Path:
     return cache_root
 
 
+def _parse_ucf_splits(splits: Sequence[str] | str | None) -> list[str]:
+    if splits is None:
+        return ["train", "validation"]
+    if isinstance(splits, str):
+        values = [part.strip() for part in splits.split(",") if part.strip()]
+    else:
+        values = [str(part).strip() for part in splits if str(part).strip()]
+    if not values:
+        return ["train", "validation"]
+    return [_normalize_split(value) for value in values]
+
+
+def collect_vau_ucf_basenames(
+    splits: Sequence[str] | str | None = ("train", "validation"),
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+) -> set[str]:
+    """Return bare UCF filenames referenced by the given VAU splits."""
+    selected = _parse_ucf_splits(splits)
+    names: set[str] = set()
+    for split in selected:
+        for sample in load_vau_samples(
+            split, cache_dir=cache_dir, dedup_by_video=True, sources="ucf"
+        ):
+            name = Path(sample["video_name"]).name
+            bare = name[4:] if name.startswith("ucf_") else name
+            names.add(bare)
+    return names
+
+
+def resolve_ucf_hf_paths(
+    basenames: set[str],
+    folders: Sequence[str] | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    """Map bare UCF filenames to HF repo paths and estimate download size."""
+    from huggingface_hub import list_repo_tree
+
+    selected = list(folders) if folders is not None else list(UCF_HF_FOLDERS)
+    folder_set = set(selected)
+    wanted = set(basenames)
+    paths: list[str] = []
+    matched: set[str] = set()
+    total_bytes = 0
+
+    for entry in list_repo_tree(
+        UCF_HF_REPO_ID, repo_type="dataset", recursive=True
+    ):
+        path = getattr(entry, "path", None) or ""
+        if not path.endswith(".mp4"):
+            continue
+        top = path.split("/", 1)[0]
+        if top not in folder_set:
+            continue
+        fname = path.rsplit("/", 1)[-1]
+        if fname not in wanted:
+            continue
+        paths.append(path)
+        matched.add(fname)
+        total_bytes += int(getattr(entry, "size", 0) or 0)
+
+    missing = sorted(wanted - matched)
+    meta = {
+        "requested": len(wanted),
+        "matched": len(matched),
+        "missing": missing[:20],
+        "missing_count": len(missing),
+        "approx_bytes": total_bytes,
+        "approx_gb": round(total_bytes / 1e9, 2),
+        "folders": selected,
+    }
+    return sorted(paths), meta
+
+
 def ensure_ucf_videos(
     download_dir: str | Path = DEFAULT_UCF_DOWNLOAD_DIR,
     video_root: str | Path | None = None,
@@ -151,41 +223,71 @@ def ensure_ucf_videos(
     stage: bool = True,
     link: bool = True,
     folders: Sequence[str] | None = None,
+    vau_only: bool = False,
+    splits: Sequence[str] | str | None = ("train", "validation"),
 ) -> dict[str, object]:
     """Download UCF-Crime videos from Hugging Face and optionally stage them.
 
     Videos are pulled from ``etornam/ufc-crime-videos`` into ``download_dir``,
     then symlinked/copied into ``video_root`` as ``ucf_<filename>``.
+
+    When ``vau_only`` is True, only files referenced by VAU-Bench ``splits``
+    (default: train + validation, ~57 GB) are downloaded.
     """
     download_root = Path(download_dir)
     download_root.mkdir(parents=True, exist_ok=True)
     selected = list(folders) if folders is not None else list(UCF_HF_FOLDERS)
-    allow_patterns: list[str] = [f"{folder}/**" for folder in selected]
-    allow_patterns.extend(
-        [
-            "Anomaly_Train.txt",
-            "ReadMe-Anomaly-Detection.txt",
-            "Temporal_Anomaly_Annotation_for_Testing_Videos.txt",
-            "UCF_Crimes-Train-Test-Split/**",
-        ]
-    )
+    meta_patterns = [
+        "Anomaly_Train.txt",
+        "ReadMe-Anomaly-Detection.txt",
+        "Temporal_Anomaly_Annotation_for_Testing_Videos.txt",
+        "UCF_Crimes-Train-Test-Split/**",
+    ]
 
-    print(
-        f"Downloading UCF-Crime videos from {UCF_HF_REPO_ID} "
-        f"into {download_root} (~105 GB) ..."
-    )
+    report: dict[str, object] = {
+        "repo_id": UCF_HF_REPO_ID,
+        "folders": selected,
+        "vau_only": vau_only,
+    }
+
+    if vau_only:
+        selected_splits = _parse_ucf_splits(splits)
+        basenames = collect_vau_ucf_basenames(
+            selected_splits, cache_dir=cache_dir
+        )
+        allow_patterns, path_meta = resolve_ucf_hf_paths(
+            basenames, folders=selected
+        )
+        if not allow_patterns:
+            raise RuntimeError(
+                "No UCF HF paths matched VAU basenames; check annotations "
+                f"and repo {UCF_HF_REPO_ID}"
+            )
+        allow_patterns = allow_patterns + meta_patterns
+        report["splits"] = selected_splits
+        report["selection"] = path_meta
+        size_note = f"~{path_meta['approx_gb']} GB"
+        print(
+            f"Downloading {path_meta['matched']} VAU-referenced UCF videos "
+            f"({', '.join(selected_splits)}) from {UCF_HF_REPO_ID} "
+            f"into {download_root} ({size_note}) ..."
+        )
+    else:
+        allow_patterns = [f"{folder}/**" for folder in selected] + meta_patterns
+        size_note = "~105 GB"
+        print(
+            f"Downloading UCF-Crime videos from {UCF_HF_REPO_ID} "
+            f"into {download_root} ({size_note}) ..."
+        )
+
     local_path = snapshot_download(
         repo_id=UCF_HF_REPO_ID,
         repo_type="dataset",
         local_dir=str(download_root),
         allow_patterns=allow_patterns,
     )
+    report["download_dir"] = str(local_path)
 
-    report: dict[str, object] = {
-        "download_dir": str(local_path),
-        "repo_id": UCF_HF_REPO_ID,
-        "folders": selected,
-    }
     if stage:
         if video_root is None:
             video_root = Path(cache_dir) / "videos"
@@ -659,8 +761,24 @@ if __name__ == "__main__":
         "--download-ucf",
         action="store_true",
         help=(
-            f"Download UCF-Crime videos from {UCF_HF_REPO_ID} (~105 GB) "
+            f"Download UCF-Crime videos from {UCF_HF_REPO_ID} "
             f"into {DEFAULT_UCF_DOWNLOAD_DIR} and stage as ucf_* under videos/"
+        ),
+    )
+    parser.add_argument(
+        "--vau-only",
+        action="store_true",
+        help=(
+            "With --download-ucf, only fetch videos referenced by VAU splits "
+            "(default train+validation, ~57 GB instead of ~105 GB)"
+        ),
+    )
+    parser.add_argument(
+        "--ucf-splits",
+        default="train,validation",
+        help=(
+            "With --download-ucf --vau-only, comma-separated VAU splits "
+            "whose videos to fetch (default: train,validation)"
         ),
     )
     parser.add_argument(
@@ -709,6 +827,8 @@ if __name__ == "__main__":
                 cache_dir=args.cache_dir,
                 stage=True,
                 link=not args.copy,
+                vau_only=args.vau_only,
+                splits=args.ucf_splits,
             )
         print(json.dumps(report, indent=2, default=str))
     elif args.stage_ucf:
@@ -753,7 +873,7 @@ if __name__ == "__main__":
         print(f"Anomaly classes ({len(classes)}): {classes}")
         if not args.annotations_only:
             print(
-                "Annotations are ready. Download UCF videos with "
-                "`python -m heads.vqa.vau_dataset --download-ucf`, then "
-                "run with --verify-videos --sources ucf."
+                "Annotations are ready. For a disk-friendly UCF download (~57 GB):\n"
+                "  python -m heads.vqa.vau_dataset --download-ucf --vau-only\n"
+                "Then verify with --verify-videos --sources ucf."
             )

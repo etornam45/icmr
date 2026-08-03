@@ -15,21 +15,25 @@ Video-only Description captioning lives under [`heads/vqa`](../vqa) with
 
 Annotations come from Hugging Face. **UCF-Crime videos** come from
 [`etornam/ufc-crime-videos`](https://huggingface.co/datasets/etornam/ufc-crime-videos)
-(~105 GB) and are staged as `ucf_*` under `data/VAU-Bench/videos/`. Training
-defaults to **UCF-only** (`--sources ucf`).
+(~57 GB with `--vau-only` for train+val; ~105 GB full) and are staged as
+`ucf_*` under `data/VAU-Bench/videos/`. Training defaults to **UCF-only**
+(`--sources ucf`).
 
 ```bash
 # 1. Download annotations
 python -m heads.vqa.vau_dataset --annotations-only --split train
 
-# 2. Download UCF from HF and stage as ucf_* (~105 GB)
-python -m heads.vqa.vau_dataset --download-ucf
+# 2. Download only UCF videos named in VAU train+val (~57 GB) and stage as ucf_*
+python -m heads.vqa.vau_dataset --download-ucf --vau-only
+# Full mirror (~105 GB): omit --vau-only
 # python -m heads.vqa.vau_dataset --download-ucf --stage-only  # if already downloaded
 
 # 3. Verify UCF coverage
 python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split train
 python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split validation
 ```
+
+Train with `--skip-missing-videos` so incomplete downloads are skipped.
 
 Original UCF citation:
 [UCF-Crime project page](https://www.crcv.ucf.edu/projects/real-world/).
