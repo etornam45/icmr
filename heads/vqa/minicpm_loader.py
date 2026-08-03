@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
+from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
 
 MINICPM_MODEL_NAME = "openbmb/MiniCPM5-1B"
@@ -100,8 +100,8 @@ def load_minicpm_llm(
     model_name: str = MINICPM_MODEL_NAME,
     lora_r: int = 16,
     lora_alpha: int = 32,
-    adapter_path: Optional[str] = None,
-) -> torch.nn.Module:
+    adapter_path: str | None = None,
+) -> nn.Module:
     source = (
         _pretrained_source(require_tokenizer=False)
         if model_name == MINICPM_MODEL_NAME
@@ -167,10 +167,10 @@ def _to_token_ids(result) -> list[int]:
 
 def apply_chat(
     tokenizer: PreTrainedTokenizer,
-    messages: List[dict],
+    messages: list[dict],
     add_generation_prompt: bool = False,
     tokenize: bool = True,
-    return_tensors: Optional[str] = "pt",
+    return_tensors: str | None = "pt",
 ):
     result = tokenizer.apply_chat_template(
         messages,

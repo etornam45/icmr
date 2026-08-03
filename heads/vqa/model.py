@@ -1,8 +1,7 @@
 from pathlib import Path
-from typing import Optional
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from dinov3.checkpoints.load import (
     ensure_backbone_checkpoint,
@@ -105,8 +104,8 @@ class DINOv3MiniCPMHybrid(nn.Module):
         self,
         visual_embeds: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        labels: Optional[torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        labels: torch.Tensor | None,
     ):
         text_embeds = self._get_text_embeddings(input_ids)
         visual_embeds = visual_embeds.to(dtype=text_embeds.dtype)
@@ -140,8 +139,8 @@ class DINOv3MiniCPMHybrid(nn.Module):
         self,
         videos: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
     ):
         visual_embeds = self.encode_visual(videos)
         inputs_embeds, attention_mask, labels = self._merge_visual_and_text(
@@ -159,7 +158,7 @@ class DINOv3MiniCPMHybrid(nn.Module):
         self,
         videos: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         max_new_tokens: int = 128,
         num_beams: int = 1,
     ) -> torch.Tensor:
@@ -211,7 +210,7 @@ def build_hybrid_model(
     num_frames: int = DEFAULT_NUM_FRAMES,
     lora_r: int = 16,
     lora_alpha: int = 32,
-    adapter_path: Optional[str] = None,
+    adapter_path: str | None = None,
 ):
     vision_model = vit_small(
         patch_size=16,

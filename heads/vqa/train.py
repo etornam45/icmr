@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 
 import torch
-import torch.optim as optim
+from torch import optim
 from tqdm import tqdm
 
 from dinov3.utils.device import get_device
