@@ -43,10 +43,10 @@ class MonitorService:
         self._latest_meta: dict[str, Any] = {
             "anomaly": None,
             "score": None,
-            "overlay_mode": self.overlay_mode,
             "detections": [],
             "source": None,
             "running": False,
+            "is_anomaly": False,
         }
         self._lock = asyncio.Lock()
 
@@ -157,7 +157,6 @@ class MonitorService:
                         self.runtime,
                         frames,
                         preview,
-                        self.overlay_mode,
                         self.cfg,
                     )
                 except Exception:
@@ -165,20 +164,23 @@ class MonitorService:
                     await asyncio.sleep(self.cfg.inference_interval_sec)
                     continue
 
+                frames_b64 = {
+                    key: base64.b64encode(jpeg).decode("ascii")
+                    for key, jpeg in result.jpegs.items()
+                }
                 meta = {
                     "type": "frame",
-                    "jpeg_b64": base64.b64encode(result.jpeg).decode("ascii"),
+                    "frames": frames_b64,
                     "anomaly": result.anomaly_class,
                     "score": result.anomaly_score,
                     "top_k": result.top_k,
-                    "overlay_mode": self.overlay_mode,
                     "detections": result.detections,
                     "source": {"type": source.type, "uri": source.uri},
                     "running": True,
                     "is_anomaly": result.is_anomaly,
                 }
                 self._latest_meta = {
-                    k: v for k, v in meta.items() if k != "jpeg_b64"
+                    k: v for k, v in meta.items() if k != "frames"
                 }
                 await self._broadcast(meta)
 

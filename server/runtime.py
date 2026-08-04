@@ -108,7 +108,8 @@ def _peek_vqa_num_frames(checkpoint_dir: Path, default: int) -> int:
         return default
     try:
         state = torch.load(vision_path, map_location="cpu", weights_only=True)
-        frames = state.get("num_frames", state.get("num_visual_tokens"))
+        # Prefer num_frames only: num_visual_tokens is T * spatial_pool^2.
+        frames = state.get("num_frames")
         if frames is not None:
             return int(frames)
     except Exception:

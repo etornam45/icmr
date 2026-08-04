@@ -117,22 +117,55 @@ select {
   border-right: 1px solid var(--line);
 }
 
-.live-view {
-  position: relative;
+.inference-grid {
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.inference-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
   background: #050708;
   overflow: hidden;
 }
 
-.live-view.alert::after {
+.inference-pane.alert::after {
   content: "";
   pointer-events: none;
   position: absolute;
   inset: 0;
   z-index: 2;
   box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--danger) 70%, transparent);
+}
+
+.pane-title {
+  flex-shrink: 0;
+  z-index: 3;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: color-mix(in srgb, #0a0c0e 88%, transparent);
+  border-bottom: 1px solid var(--line);
+}
+
+.pane-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
 }
 
 .live-frame {
@@ -145,47 +178,88 @@ select {
   background: #000;
 }
 
-.live-placeholder {
+.live-placeholder,
+.pane-placeholder,
+.captions-empty {
   position: absolute;
   inset: 0;
   display: grid;
   place-content: center;
   text-align: center;
   color: var(--muted);
-  padding: 2rem;
+  padding: 1.25rem;
+  margin: 0;
 }
 
-.brand-mark {
-  display: block;
-  font-size: 3rem;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  color: color-mix(in srgb, var(--text) 35%, transparent);
-  margin-bottom: 0.75rem;
+.pane-placeholder p,
+.captions-empty p {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
-.live-badge {
+.captions-pane .pane-body {
+  background: color-mix(in srgb, var(--bg-elev) 70%, #050708);
+}
+
+.captions-body {
+  overflow: auto;
+}
+
+.captions-list {
   position: absolute;
-  top: 1rem;
-  left: 1rem;
-  z-index: 3;
+  inset: 0;
+  padding: 0.75rem 0.9rem 1rem;
   display: flex;
-  gap: 0.75rem;
+  flex-direction: column;
+  gap: 0.85rem;
+  overflow: auto;
+}
+
+.captions-item {
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.captions-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.captions-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
   align-items: baseline;
-  padding: 0.55rem 0.85rem 0.55rem 0.95rem;
-  background: color-mix(in srgb, #0a0c0e 82%, transparent);
-  border-left: 3px solid var(--accent);
-  backdrop-filter: blur(6px);
   font-family: var(--font-mono);
+  font-size: 0.75rem;
 }
 
-.badge-label {
+.captions-class {
   font-weight: 600;
-  letter-spacing: 0.02em;
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  color: var(--text);
 }
 
-.badge-score {
+.captions-score {
   color: var(--accent);
+}
+
+.captions-time {
+  color: var(--muted);
+  margin-left: auto;
+}
+
+.captions-text {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  color: color-mix(in srgb, var(--text) 90%, var(--muted));
+  white-space: pre-wrap;
 }
 
 .stage-controls {
@@ -288,8 +362,7 @@ select {
   min-height: 2.4rem;
 }
 
-.source-controls button,
-.overlay-toggle button {
+.source-controls button {
   background: var(--accent);
   color: #1a1206;
   border: none;
@@ -299,8 +372,7 @@ select {
   cursor: pointer;
 }
 
-.source-controls button:disabled,
-.overlay-toggle button:disabled {
+.source-controls button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
@@ -315,39 +387,6 @@ select {
   margin: 0.5rem 0 0;
   color: var(--danger);
   font-size: 0.85rem;
-}
-
-.mode-field {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.overlay-toggle {
-  display: flex;
-  gap: 0;
-  border: 1px solid var(--line);
-}
-
-.overlay-toggle button {
-  background: transparent;
-  color: var(--muted);
-  border: none;
-  border-right: 1px solid var(--line);
-  border-radius: 0;
-  font-weight: 500;
-  font-size: 0.8rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.overlay-toggle button:last-child {
-  border-right: none;
-}
-
-.overlay-toggle button.active {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-  color: var(--text);
 }
 
 .rail {
@@ -441,12 +480,20 @@ select {
     min-height: 0;
   }
 
-  .live-view {
+  .inference-grid {
     min-height: 0;
   }
 
   .rail {
     border-top: 1px solid var(--line);
     max-height: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .inference-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: repeat(4, minmax(140px, 1fr));
+    overflow: auto;
   }
 }

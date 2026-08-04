@@ -2,11 +2,14 @@ import { wsUrl } from './api'
 
 export type LiveFrameMessage = {
   type: 'frame'
-  jpeg_b64: string
+  frames: {
+    detection: string
+    pca: string
+    anomaly: string
+  }
   anomaly: string | null
   score: number | null
   top_k?: { class: string; probability: number }[]
-  overlay_mode: string
   detections: unknown[]
   source: { type: string; uri: string } | null
   running: boolean

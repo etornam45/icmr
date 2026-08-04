@@ -11,7 +11,7 @@ Supports CUDA, Apple Silicon (MPS), and CPU with automatic device detection.
 - **Multiple Architectures**: `vit_small`, `vit_base`, `vit_large`, `vit_so400m`, `vit_huge2`, `vit_giant2`, `vit_7b`.
 - **Advanced Components**: RoPE, SwiGLU FFN, LayerScale, storage/register tokens.
 - **DETR Detection Head**: Trainable deformable-attention decoder on COCO using frozen DINOv3 patch tokens.
-- **VQA / Captioning Head**: DINOv3 + MiniCPM5-1B hybrid (LoRA + vision adapter) for CUVA video QA and VAU-Bench Description captioning.
+- **VQA / Captioning Head**: DINOv3 spatial-pooled patch tokens + MiniCPM5-1B (LoRA + vision adapter) for CUVA video QA and VAU-Bench Description captioning.
 - **Anomaly Head**: DINOv3 temporal-pooled classifier for VAU-Bench `Anomaly Class`.
 
 ## Installation

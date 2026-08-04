@@ -1,7 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 export type SourceType = 'file' | 'rtsp' | 'stream'
-export type OverlayMode = 'none' | 'detection' | 'pca'
 
 export type EventItem = {
   id: number
@@ -37,16 +36,6 @@ export async function uploadSource(file: File) {
 
 export async function stopSource() {
   const res = await fetch(`${API_BASE}/source/stop`, { method: 'POST' })
-  if (!res.ok) throw new Error(await res.text())
-  return res.json()
-}
-
-export async function setOverlay(mode: OverlayMode) {
-  const res = await fetch(`${API_BASE}/overlay`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode }),
-  })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }

@@ -14,13 +14,13 @@ from heads.anomaly.inference import predict_from_cls
 from heads.detr.dataset import letterbox
 from heads.detr.predict import detect_from_patches
 from server.config import ServerConfig
-from server.overlays import render_preview
+from server.overlays import render_all_previews
 from server.runtime import ModelRuntime, encode_video_window
 
 
 @dataclass
 class PipelineResult:
-    jpeg: bytes
+    jpegs: dict[str, bytes]
     anomaly_class: str | None
     anomaly_score: float | None
     top_k: list[dict[str, Any]]
@@ -66,7 +66,6 @@ def run_pipeline(
     runtime: ModelRuntime,
     frames_bgr: list[np.ndarray],
     preview_bgr: np.ndarray,
-    overlay_mode: str,
     cfg: ServerConfig,
 ) -> PipelineResult:
     if not frames_bgr:
@@ -95,9 +94,8 @@ def run_pipeline(
         anomaly_score = float(result["score"])
         top_k = result["top_k"]
 
-    jpeg = render_preview(
+    jpegs = render_all_previews(
         preview_bgr,
-        overlay_mode=overlay_mode,
         detections=detections,
         patch_tokens=features["last_patches"][0],
         anomaly_label=anomaly_class,
@@ -106,7 +104,7 @@ def run_pipeline(
     )
 
     return PipelineResult(
-        jpeg=jpeg,
+        jpegs=jpegs,
         anomaly_class=anomaly_class,
         anomaly_score=anomaly_score,
         top_k=top_k,

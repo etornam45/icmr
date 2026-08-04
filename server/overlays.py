@@ -84,6 +84,39 @@ def draw_anomaly_badge(
     return out
 
 
+def encode_jpeg(frame_bgr: np.ndarray, jpeg_quality: int = 75) -> bytes:
+    ok, buf = cv2.imencode(
+        ".jpg",
+        frame_bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+    )
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    return buf.tobytes()
+
+
+def render_all_previews(
+    frame_bgr: np.ndarray,
+    detections: list[dict[str, Any]],
+    patch_tokens,
+    anomaly_label: str | None,
+    anomaly_score: float | None,
+    jpeg_quality: int = 75,
+) -> dict[str, bytes]:
+    """Encode detection, PCA, and anomaly preview JPEGs."""
+    detection = draw_detections(frame_bgr, detections)
+    if patch_tokens is not None:
+        pca = blend_pca_overlay(frame_bgr, patch_tokens)
+    else:
+        pca = frame_bgr.copy()
+    anomaly = draw_anomaly_badge(frame_bgr.copy(), anomaly_label, anomaly_score)
+    return {
+        "detection": encode_jpeg(detection, jpeg_quality),
+        "pca": encode_jpeg(pca, jpeg_quality),
+        "anomaly": encode_jpeg(anomaly, jpeg_quality),
+    }
+
+
 def render_preview(
     frame_bgr: np.ndarray,
     overlay_mode: str,
@@ -93,7 +126,7 @@ def render_preview(
     anomaly_score: float | None,
     jpeg_quality: int = 75,
 ) -> bytes:
-    """Compose overlay + badge and encode JPEG bytes."""
+    """Compose a single overlay + badge and encode JPEG bytes."""
     if overlay_mode == "detection":
         framed = draw_detections(frame_bgr, detections)
     elif overlay_mode == "pca" and patch_tokens is not None:
@@ -102,11 +135,4 @@ def render_preview(
         framed = frame_bgr.copy()
 
     framed = draw_anomaly_badge(framed, anomaly_label, anomaly_score)
-    ok, buf = cv2.imencode(
-        ".jpg",
-        framed,
-        [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
-    )
-    if not ok:
-        raise RuntimeError("JPEG encode failed")
-    return buf.tobytes()
+    return encode_jpeg(framed, jpeg_quality)

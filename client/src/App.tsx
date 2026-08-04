@@ -1,34 +1,29 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   fetchEvents,
-  setOverlay,
   startSource,
   stopSource,
   uploadSource,
   type EventItem,
-  type OverlayMode,
   type SourceType,
 } from './api'
 import { EventTimeline } from './components/EventTimeline'
-import { LiveView } from './components/LiveView'
-import { OverlayToggle } from './components/OverlayToggle'
+import { InferenceGrid } from './components/InferenceGrid'
 import { SourceControls } from './components/SourceControls'
 import { connectLive, type LiveFrameMessage } from './live'
 import './App.css'
 
 function App() {
-  const [frameUrl, setFrameUrl] = useState<string | null>(null)
-  const [anomaly, setAnomaly] = useState<string | null>(null)
-  const [score, setScore] = useState<number | null>(null)
+  const [detectionUrl, setDetectionUrl] = useState<string | null>(null)
+  const [pcaUrl, setPcaUrl] = useState<string | null>(null)
+  const [anomalyUrl, setAnomalyUrl] = useState<string | null>(null)
   const [isAnomaly, setIsAnomaly] = useState(false)
   const [running, setRunning] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [overlay, setOverlayMode] = useState<OverlayMode>('none')
   const [events, setEvents] = useState<EventItem[]>([])
   const [wsStatus, setWsStatus] = useState<'connecting' | 'open' | 'closed'>(
     'connecting',
   )
-  const prevUrl = useRef<string | null>(null)
 
   const refreshEvents = useCallback(async () => {
     try {
@@ -58,22 +53,19 @@ function App() {
   }, [refreshEvents])
 
   const applyFrame = (msg: LiveFrameMessage) => {
-    const url = `data:image/jpeg;base64,${msg.jpeg_b64}`
-    if (prevUrl.current) URL.revokeObjectURL(prevUrl.current)
-    // data URLs don't need revoke, but keep ref for consistency if we switch
-    prevUrl.current = null
-    setFrameUrl(url)
-    setAnomaly(msg.anomaly)
-    setScore(msg.score)
+    const { frames } = msg
+    setDetectionUrl(`data:image/jpeg;base64,${frames.detection}`)
+    setPcaUrl(`data:image/jpeg;base64,${frames.pca}`)
+    setAnomalyUrl(`data:image/jpeg;base64,${frames.anomaly}`)
     setIsAnomaly(msg.is_anomaly)
     setRunning(msg.running)
-    if (
-      msg.overlay_mode === 'none' ||
-      msg.overlay_mode === 'detection' ||
-      msg.overlay_mode === 'pca'
-    ) {
-      setOverlayMode(msg.overlay_mode)
-    }
+  }
+
+  const clearFrames = () => {
+    setDetectionUrl(null)
+    setPcaUrl(null)
+    setAnomalyUrl(null)
+    setIsAnomaly(false)
   }
 
   const onStart = async (type: SourceType, uri: string) => {
@@ -101,21 +93,9 @@ function App() {
     try {
       await stopSource()
       setRunning(false)
-      setFrameUrl(null)
-      setAnomaly(null)
-      setScore(null)
-      setIsAnomaly(false)
+      clearFrames()
     } finally {
       setBusy(false)
-    }
-  }
-
-  const onOverlay = async (mode: OverlayMode) => {
-    setOverlayMode(mode)
-    try {
-      await setOverlay(mode)
-    } catch {
-      // ignore
     }
   }
 
@@ -133,11 +113,13 @@ function App() {
 
       <main className="monitor">
         <section className="stage">
-          <LiveView
-            frameUrl={frameUrl}
-            anomaly={anomaly}
-            score={score}
+          <InferenceGrid
+            detectionUrl={detectionUrl}
+            pcaUrl={pcaUrl}
+            anomalyUrl={anomalyUrl}
             isAnomaly={isAnomaly}
+            events={events}
+            idle={!running && !detectionUrl}
           />
           <div className="stage-controls">
             <SourceControls
@@ -147,7 +129,6 @@ function App() {
               onUpload={onUpload}
               onStop={onStop}
             />
-            <OverlayToggle mode={overlay} onChange={onOverlay} />
           </div>
         </section>
 
