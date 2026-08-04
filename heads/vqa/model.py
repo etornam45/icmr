@@ -211,25 +211,29 @@ def build_hybrid_model(
     lora_r: int = 16,
     lora_alpha: int = 32,
     adapter_path: str | None = None,
+    vision_model: nn.Module | None = None,
 ):
-    vision_model = vit_small(
-        patch_size=16,
-        n_storage_tokens=4,
-        layerscale_init=1e-5,
-        mask_k_bias=True,
-    )
-    if Path(backbone_weights).exists() and not validate_checkpoint_file(
-        backbone_weights, expected_sha256=None
-    ):
-        print(f"Warning: checkpoint at {backbone_weights} looks corrupt, re-downloading")
-        Path(backbone_weights).unlink(missing_ok=True)
+    if vision_model is None:
+        vision_model = vit_small(
+            patch_size=16,
+            n_storage_tokens=4,
+            layerscale_init=1e-5,
+            mask_k_bias=True,
+        )
+        if Path(backbone_weights).exists() and not validate_checkpoint_file(
+            backbone_weights, expected_sha256=None
+        ):
+            print(
+                f"Warning: checkpoint at {backbone_weights} looks corrupt, re-downloading"
+            )
+            Path(backbone_weights).unlink(missing_ok=True)
 
-    backbone_weights = ensure_backbone_checkpoint(backbone_weights)
-    load_checkpoint(vision_model, backbone_weights)
-    vision_model.to(device)
-    vision_model.eval()
-    for param in vision_model.parameters():
-        param.requires_grad = False
+        backbone_weights = ensure_backbone_checkpoint(backbone_weights)
+        load_checkpoint(vision_model, backbone_weights)
+        vision_model.to(device)
+        vision_model.eval()
+        for param in vision_model.parameters():
+            param.requires_grad = False
 
     llm = load_minicpm_llm(
         device,

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+from transformers import PreTrainedTokenizer
 
 from dinov3.utils.device import get_device
 from heads.vqa.dataset import (
@@ -11,6 +12,7 @@ from heads.vqa.dataset import (
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
     IMG_SIZE,
+    DINOv3MiniCPMHybrid,
     build_hybrid_model,
     decode_generated_answer,
     load_hybrid_checkpoint,
@@ -18,6 +20,48 @@ from heads.vqa.model import (
 from heads.vqa.vau_dataset import CAPTION_PROMPT
 
 VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_minicpm"
+
+
+def resolve_vqa_checkpoint(checkpoint_dir: str | Path) -> Path:
+    checkpoint_path = Path(checkpoint_dir)
+    best_path = checkpoint_path.parent / f"{checkpoint_path.name}_best"
+    if not checkpoint_path.exists() and best_path.exists():
+        return best_path
+    return checkpoint_path
+
+
+@torch.no_grad()
+def generate_caption(
+    model: DINOv3MiniCPMHybrid,
+    tokenizer: PreTrainedTokenizer,
+    videos: torch.Tensor,
+    question: str | None = None,
+    max_new_tokens: int = 128,
+) -> str:
+    """Caption a video tensor [B, T, 3, H, W] or [T, 3, H, W] with a loaded model."""
+    if videos.dim() == 4:
+        videos = videos.unsqueeze(0)
+    if question is None:
+        question = CAPTION_PROMPT
+
+    device = videos.device
+    prompt = encode_user_prompt(tokenizer, [question], device)
+    prompt_len = prompt["input_ids"].shape[1]
+    num_frames = videos.shape[1]
+
+    gen_ids = model.generate(
+        videos,
+        prompt["input_ids"],
+        attention_mask=prompt["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        num_beams=1,
+    )
+    return decode_generated_answer(
+        tokenizer,
+        gen_ids,
+        prompt_len,
+        num_visual_tokens=num_frames,
+    )
 
 
 def run_inference(
@@ -28,24 +72,25 @@ def run_inference(
     checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
     start_sec: float | None = None,
     end_sec: float | None = None,
+    model: DINOv3MiniCPMHybrid | None = None,
+    tokenizer: PreTrainedTokenizer | None = None,
 ) -> str:
     device = get_device()
 
     if question is None:
         question = CAPTION_PROMPT
 
-    checkpoint_path = Path(checkpoint_dir)
-    best_path = checkpoint_path.parent / f"{checkpoint_path.name}_best"
-    if not checkpoint_path.exists() and best_path.exists():
-        checkpoint_path = best_path
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"No checkpoint at {checkpoint_dir}. Run python -m heads.vqa.train first."
+    if model is None or tokenizer is None:
+        checkpoint_path = resolve_vqa_checkpoint(checkpoint_dir)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"No checkpoint at {checkpoint_dir}. Run python -m heads.vqa.train first."
+            )
+        model, tokenizer = build_hybrid_model(device, num_frames=num_frames)
+        load_hybrid_checkpoint(
+            model, str(checkpoint_path), device, trainable_adapter=False
         )
-
-    model, tokenizer = build_hybrid_model(device, num_frames=num_frames)
-    load_hybrid_checkpoint(model, str(checkpoint_path), device, trainable_adapter=False)
-    model.eval()
+        model.eval()
 
     frames = load_video_frames(
         video_path,
@@ -55,22 +100,12 @@ def run_inference(
         end_sec=end_sec,
     ).unsqueeze(0).to(device)
 
-    prompt = encode_user_prompt(tokenizer, [question], device)
-    prompt_len = prompt["input_ids"].shape[1]
-
-    gen_ids = model.generate(
-        frames,
-        prompt["input_ids"],
-        attention_mask=prompt["attention_mask"],
-        max_new_tokens=max_new_tokens,
-        num_beams=1,
-    )
-
-    answer = decode_generated_answer(
+    answer = generate_caption(
+        model,
         tokenizer,
-        gen_ids,
-        prompt_len,
-        num_visual_tokens=model.num_visual_tokens,
+        frames,
+        question=question,
+        max_new_tokens=max_new_tokens,
     )
     print(f"Generated answer: {answer}")
     return answer

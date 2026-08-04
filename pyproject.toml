@@ -21,4 +21,9 @@ dependencies = [
     "nltk",
     "peft",
     "accelerate",
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+    "pydantic",
+    "python-multipart",
 ]
