@@ -14,6 +14,7 @@ from heads.vqa.dataset import (
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_NUM_FRAMES,
+    DINOv3MiniCPMHybrid,
     adapter_trainable_params,
     build_hybrid_model,
     decode_generated_answer,
@@ -85,12 +86,31 @@ def parse_args():
         default=None,
         help="Eval split (default: test for cuva, validation for vau)",
     )
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument(
+        "--adapter-epochs",
+        type=int,
+        default=2,
+        help="Stage 1: train vision adapter only with LoRA frozen (0 to skip)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Stage 2: joint vision adapter + LoRA epochs",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
-    parser.add_argument("--llm-lr", type=float, default=2e-4, help="LoRA learning rate")
     parser.add_argument(
-        "--adapter-lr", type=float, default=1e-4, help="Vision adapter learning rate"
+        "--llm-lr",
+        type=float,
+        default=5e-5,
+        help="LoRA learning rate (joint stage)",
+    )
+    parser.add_argument(
+        "--adapter-lr",
+        type=float,
+        default=5e-4,
+        help="Vision adapter learning rate",
     )
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -99,6 +119,19 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=2,
+        help="Early stop after this many joint-stage evals without improvement "
+        "(0 disables)",
+    )
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=4,
+        help="Number of spaced eval generations to print / log per epoch",
+    )
     parser.add_argument(
         "--log-db",
         type=str,
@@ -172,13 +205,44 @@ def _make_loader(args, tokenizer, split: str, shuffle: bool):
     )
 
 
-def train_epoch(model, loader, optimizer, device):
+def _set_lora_requires_grad(model: DINOv3MiniCPMHybrid, trainable: bool) -> int:
+    """Enable/disable grads on LoRA parameters. Returns how many were toggled."""
+    count = 0
+    for name, param in model.llm.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = trainable
+            count += 1
+    return count
+
+
+def build_optimizer(
+    model: DINOv3MiniCPMHybrid,
+    adapter_lr: float,
+    llm_lr: float | None,
+    weight_decay: float,
+    include_lora: bool,
+):
+    groups = [
+        {
+            "params": vision_adapter_params(model),
+            "lr": adapter_lr,
+        }
+    ]
+    if include_lora:
+        lora_params = adapter_trainable_params(model)
+        if not lora_params:
+            raise RuntimeError("No trainable LoRA parameters found for joint stage")
+        groups.append({"params": lora_params, "lr": llm_lr})
+    return optim.AdamW(groups, weight_decay=weight_decay)
+
+
+def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
     model.train()
     model.vision_model.eval()
     total_loss = 0.0
     num_batches = 0
 
-    pbar = tqdm(loader, desc="Training", leave=False)
+    pbar = tqdm(loader, desc=desc, leave=False)
     for batch in pbar:
         videos = batch["video"].to(device)
         input_ids = batch["input_ids"].to(device)
@@ -204,15 +268,34 @@ def train_epoch(model, loader, optimizer, device):
     return total_loss / max(num_batches, 1)
 
 
+def _gen_sample_batch_indices(num_batches: int, max_samples: int) -> set[int]:
+    """Evenly spaced batch indices so eval gens cover different clips."""
+    if num_batches <= 0 or max_samples <= 0:
+        return set()
+    count = min(max_samples, num_batches)
+    if count == 1:
+        return {0}
+    return {round(i * (num_batches - 1) / (count - 1)) for i in range(count)}
+
+
 @torch.no_grad()
-def evaluate(model, loader, tokenizer, device, max_gen_samples: int = 8):
+def evaluate(
+    model,
+    loader,
+    tokenizer,
+    device,
+    max_gen_samples: int = 4,
+):
     model.eval()
     total_loss = 0.0
     references = []
     hypotheses = []
     questions = []
+    clip_ids = []
 
-    for batch in tqdm(loader, desc="Evaluating", leave=False):
+    sample_batches = _gen_sample_batch_indices(len(loader), max_gen_samples)
+
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluating", leave=False)):
         videos = batch["video"].to(device)
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -221,7 +304,7 @@ def evaluate(model, loader, tokenizer, device, max_gen_samples: int = 8):
         outputs = model(videos, input_ids, attention_mask, labels=labels)
         total_loss += outputs.loss.item()
 
-        if len(references) < max_gen_samples:
+        if batch_idx in sample_batches:
             prompt = encode_user_prompt(tokenizer, [batch["question"][0]], device)
             prompt_len = prompt["input_ids"].shape[1]
             gen_ids = model.generate(
@@ -231,19 +314,89 @@ def evaluate(model, loader, tokenizer, device, max_gen_samples: int = 8):
                 max_new_tokens=128,
                 num_beams=1,
             )
+            num_visual = videos.shape[1] * model.tokens_per_frame
             hypotheses.append(
                 decode_generated_answer(
                     tokenizer,
                     gen_ids,
                     prompt_len,
-                    num_visual_tokens=model.num_visual_tokens,
+                    num_visual_tokens=num_visual,
                 )
             )
             references.append(batch["answer"][0])
             questions.append(batch["question"][0])
+            clip = batch.get("clip_id", batch.get("sample_id", [""]))[0]
+            clip_ids.append(clip)
 
     avg_loss = total_loss / max(len(loader), 1)
-    return avg_loss, questions, references, hypotheses
+    return avg_loss, questions, references, hypotheses, clip_ids
+
+
+def _print_eval_samples(refs, hyps, clip_ids, limit: int = 4):
+    for index, (ref, hyp) in enumerate(zip(refs, hyps)):
+        if index >= limit:
+            break
+        clip = clip_ids[index] if index < len(clip_ids) else ""
+        tag = f" [{clip}]" if clip else ""
+        print(f"  sample{index}{tag}")
+        print(f"    ref: {ref[:140]}{'...' if len(ref) > 140 else ''}")
+        print(f"    gen: {hyp[:140]}{'...' if len(hyp) > 140 else ''}")
+
+
+def run_eval_epoch(
+    args,
+    model,
+    tokenizer,
+    device,
+    logger,
+    epoch_label: str,
+    epoch_num: int,
+    best_loss: float,
+    output_dir: Path,
+    best_dir: Path,
+):
+    eval_loader, _ = _make_loader(
+        args, tokenizer, split=args.eval_split, shuffle=False
+    )
+    eval_loss, questions, refs, hyps, clip_ids = evaluate(
+        model,
+        eval_loader,
+        tokenizer,
+        device,
+        max_gen_samples=args.eval_samples,
+    )
+    del eval_loader
+
+    print(f"{epoch_label}: eval_loss={eval_loss:.4f}")
+    if refs:
+        _print_eval_samples(refs, hyps, clip_ids, limit=args.eval_samples)
+
+    if logger is not None:
+        logger.log_metrics({"eval/loss": eval_loss}, epoch=epoch_num)
+        if questions:
+            logger.log_records(
+                "eval_sample",
+                [
+                    {
+                        "clip_id": clip_id,
+                        "question": question,
+                        "reference": reference,
+                        "prediction": prediction,
+                    }
+                    for question, reference, prediction, clip_id in zip(
+                        questions, refs, hyps, clip_ids
+                    )
+                ],
+                epoch=epoch_num,
+            )
+
+    save_hybrid_checkpoint(model, str(output_dir))
+    improved = eval_loss < best_loss
+    if improved:
+        best_loss = eval_loss
+        save_hybrid_checkpoint(model, str(best_dir))
+        print(f"  saved best checkpoint (eval_loss={eval_loss:.4f})")
+    return best_loss, improved
 
 
 def main():
@@ -251,6 +404,12 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
     print(f"Dataset: {args.dataset}")
+    print(
+        f"Schedule: adapter-only={args.adapter_epochs} epoch(s), "
+        f"joint={args.epochs} epoch(s), "
+        f"adapter_lr={args.adapter_lr}, llm_lr={args.llm_lr}, "
+        f"patience={args.patience}"
+    )
     if args.dataset == "vau":
         print(f"Caption prompt: {CAPTION_PROMPT!r}")
 
@@ -270,20 +429,6 @@ def main():
     train_loader, _ = _make_loader(args, tokenizer, split="train", shuffle=True)
     print(f"Train batches: {len(train_loader)}")
 
-    optimizer = optim.AdamW(
-        [
-            {
-                "params": vision_adapter_params(model),
-                "lr": args.adapter_lr,
-            },
-            {
-                "params": adapter_trainable_params(model),
-                "lr": args.llm_lr,
-            },
-        ],
-        weight_decay=args.weight_decay,
-    )
-
     output_dir = Path(args.output)
     best_dir = output_dir.parent / f"{output_dir.name}_best"
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -299,56 +444,118 @@ def main():
         )
         print(f"Logging run {logger.run_id} to {args.log_db}")
 
+    global_epoch = 0
     try:
-        for epoch in range(args.epochs):
-            train_loss = train_epoch(model, train_loader, optimizer, device)
-
-            eval_loader, _ = _make_loader(
-                args, tokenizer, split=args.eval_split, shuffle=False
-            )
-            eval_loss, questions, refs, hyps = evaluate(
-                model, eval_loader, tokenizer, device
-            )
-            del eval_loader
-
+        # --- Stage 1: vision adapter only ---
+        if args.adapter_epochs > 0:
+            n_lora = _set_lora_requires_grad(model, trainable=False)
             print(
-                f"Epoch {epoch + 1}/{args.epochs}: "
-                f"train_loss={train_loss:.4f}, eval_loss={eval_loss:.4f}"
+                f"Stage 1: vision adapter only "
+                f"({args.adapter_epochs} epoch(s), LoRA frozen={n_lora} tensors)"
             )
-            if refs:
-                print(f"  sample ref: {refs[0][:120]}...")
-                print(f"  sample gen: {hyps[0][:120]}...")
-
-            if logger is not None:
-                logger.log_metrics(
-                    {"train/loss": train_loss, "eval/loss": eval_loss},
-                    epoch=epoch + 1,
+            optimizer = build_optimizer(
+                model,
+                adapter_lr=args.adapter_lr,
+                llm_lr=None,
+                weight_decay=args.weight_decay,
+                include_lora=False,
+            )
+            for stage_epoch in range(args.adapter_epochs):
+                global_epoch += 1
+                train_loss = train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    device,
+                    desc=f"Adapter {stage_epoch + 1}/{args.adapter_epochs}",
                 )
-                if questions:
-                    logger.log_records(
-                        "eval_sample",
-                        [
-                            {
-                                "question": question,
-                                "reference": reference,
-                                "prediction": prediction,
-                            }
-                            for question, reference, prediction in zip(
-                                questions, refs, hyps
-                            )
-                        ],
-                        epoch=epoch + 1,
+                print(
+                    f"Adapter epoch {stage_epoch + 1}/{args.adapter_epochs}: "
+                    f"train_loss={train_loss:.4f}"
+                )
+                if logger is not None:
+                    logger.log_metrics(
+                        {"train/loss": train_loss, "stage": 1},
+                        epoch=global_epoch,
                     )
+                best_loss, _ = run_eval_epoch(
+                    args,
+                    model,
+                    tokenizer,
+                    device,
+                    logger,
+                    epoch_label=(
+                        f"Adapter epoch {stage_epoch + 1}/{args.adapter_epochs}"
+                    ),
+                    epoch_num=global_epoch,
+                    best_loss=best_loss,
+                    output_dir=output_dir,
+                    best_dir=best_dir,
+                )
 
-            save_hybrid_checkpoint(model, str(output_dir))
-            if eval_loss < best_loss:
-                best_loss = eval_loss
-                save_hybrid_checkpoint(model, str(best_dir))
-                print(f"  saved best checkpoint (eval_loss={eval_loss:.4f})")
+        # --- Stage 2: joint LoRA + adapter ---
+        if args.epochs > 0:
+            n_lora = _set_lora_requires_grad(model, trainable=True)
+            print(
+                f"Stage 2: joint adapter + LoRA "
+                f"({args.epochs} epoch(s), LoRA trainable={n_lora} tensors)"
+            )
+            optimizer = build_optimizer(
+                model,
+                adapter_lr=args.adapter_lr,
+                llm_lr=args.llm_lr,
+                weight_decay=args.weight_decay,
+                include_lora=True,
+            )
+            stale = 0
+            for stage_epoch in range(args.epochs):
+                global_epoch += 1
+                train_loss = train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    device,
+                    desc=f"Joint {stage_epoch + 1}/{args.epochs}",
+                )
+                print(
+                    f"Joint epoch {stage_epoch + 1}/{args.epochs}: "
+                    f"train_loss={train_loss:.4f}"
+                )
+                if logger is not None:
+                    logger.log_metrics(
+                        {"train/loss": train_loss, "stage": 2},
+                        epoch=global_epoch,
+                    )
+                best_loss, improved = run_eval_epoch(
+                    args,
+                    model,
+                    tokenizer,
+                    device,
+                    logger,
+                    epoch_label=f"Joint epoch {stage_epoch + 1}/{args.epochs}",
+                    epoch_num=global_epoch,
+                    best_loss=best_loss,
+                    output_dir=output_dir,
+                    best_dir=best_dir,
+                )
+                if args.patience > 0:
+                    if improved:
+                        stale = 0
+                    else:
+                        stale += 1
+                        print(
+                            f"  no eval improvement ({stale}/{args.patience})"
+                        )
+                        if stale >= args.patience:
+                            print("Early stopping (patience exhausted)")
+                            break
 
         if logger is not None:
             logger.finish(status="completed")
-        print(f"Training complete. Checkpoints saved under {output_dir.parent}")
+        print(
+            f"Training complete. Best eval_loss={best_loss:.4f}. "
+            f"Checkpoints under {output_dir.parent}"
+        )
     except Exception:
         if logger is not None:
             logger.finish(status="failed")

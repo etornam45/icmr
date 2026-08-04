@@ -175,11 +175,12 @@ samples = load_cuva_samples(
 ```bash
 python -m heads.vqa.train \
   --dataset cuva \
+  --adapter-epochs 2 \
   --epochs 5 \
   --batch-size 2 \
   --num-frames 16 \
-  --llm-lr 2e-4 \
-  --adapter-lr 1e-4
+  --adapter-lr 5e-4 \
+  --llm-lr 5e-5
 ```
 
 Download videos automatically before training:
@@ -280,19 +281,26 @@ python -m heads.vqa.vau_dataset --stage-ucf /path/to/extracted/ucf
 
 ### Train (VAU Description)
 
-Defaults to UCF-only when `--dataset vau`:
+Defaults to UCF-only when `--dataset vau`. Training is **two-stage** by default:
+vision adapter only (`--adapter-epochs`, LoRA frozen), then joint adapter + LoRA
+(`--epochs`) with early stopping (`--patience`).
 
 ```bash
 python -m heads.vqa.train \
   --dataset vau \
   --sources ucf \
   --skip-missing-videos \
+  --adapter-epochs 2 \
   --epochs 5 \
   --batch-size 2 \
-  --num-frames 16
+  --num-frames 16 \
+  --adapter-lr 5e-4 \
+  --llm-lr 5e-5 \
+  --patience 2 \
+  --eval-samples 4
 ```
 
-Checkpoints default to `dinov3/checkpoints/model/vqa_vau_minicpm/`.
+Skip stage 1 with `--adapter-epochs 0`. Checkpoints default to `dinov3/checkpoints/model/vqa_vau_minicpm/`.
 
 ### Inference (VAU Description)
 
@@ -333,6 +341,7 @@ python -m heads.vqa.train \
   --skip-missing-videos \
   --log-db logs/vqa.db \
   --run-name vau-description \
+  --adapter-epochs 2 \
   --epochs 5
 ```
 
