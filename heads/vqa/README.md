@@ -7,15 +7,16 @@ Supports two datasets:
 2. **VAU-Bench** ([7xiang/VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench)) —
    video-only Description captioning (no dataset question)
 
-Architecture:
+Architecture (`video_spatial`):
 
-- **Vision**: frozen DINOv3 ViT-S CLS token for each sampled frame
-- **Adapter**: linear 384 → 1536, LayerNorm, and 1D temporal position encoding
+- **Vision**: frozen DINOv3 ViT-S patch tokens for each sampled frame
+- **Spatial pool**: adaptive avg-pool of the 14×14 patch grid to 4×4 (16 tokens/frame)
+- **Adapter**: linear 384 → 1536, LayerNorm, plus temporal (1D) and spatial (2D) sincos PE
 - **Language**: LoRA-tuned
   [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B)
 
-Each uniformly sampled frame becomes one ordered MiniCPM visual prefix token.
-Existing image-VQA checkpoints are incompatible.
+Default: 16 frames × 16 pooled tokens = **256** MiniCPM visual prefix tokens.
+CLS-only (`video_cls`) and image-VQA checkpoints are incompatible — retrain required.
 
 ---
 

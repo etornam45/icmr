@@ -34,7 +34,9 @@ VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_minicpm"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train DINOv3 CLS + MiniCPM5-1B video VQA / captioning hybrid"
+        description=(
+            "Train DINOv3 spatial-pool + MiniCPM5-1B video VQA / captioning hybrid"
+        )
     )
     parser.add_argument(
         "--dataset",

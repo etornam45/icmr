@@ -47,7 +47,6 @@ def generate_caption(
     device = videos.device
     prompt = encode_user_prompt(tokenizer, [question], device)
     prompt_len = prompt["input_ids"].shape[1]
-    num_frames = videos.shape[1]
 
     gen_ids = model.generate(
         videos,
@@ -60,7 +59,7 @@ def generate_caption(
         tokenizer,
         gen_ids,
         prompt_len,
-        num_visual_tokens=num_frames,
+        num_visual_tokens=videos.shape[1] * model.tokens_per_frame,
     )
 
 

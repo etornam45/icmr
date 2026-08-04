@@ -1,4 +1,4 @@
-"""CUVA video QA dataset for DINOv3 CLS + MiniCPM."""
+"""CUVA video QA dataset for DINOv3 spatial-pool + MiniCPM."""
 
 from __future__ import annotations
 
