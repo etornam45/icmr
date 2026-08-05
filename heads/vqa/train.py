@@ -14,7 +14,8 @@ from heads.vqa.dataset import (
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_NUM_FRAMES,
-    DINOv3MiniCPMHybrid,
+    DEFAULT_XATTN_EVERY_N,
+    DINOv3QwenXAttn,
     adapter_trainable_params,
     build_hybrid_model,
     decode_generated_answer,
@@ -30,13 +31,13 @@ from heads.vqa.vau_dataset import (
 from logger import SQLiteLogger
 
 DEFAULT_CHECKPOINT = DEFAULT_CHECKPOINT_DIR
-VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_minicpm"
+VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_qwen"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Train DINOv3 spatial-pool + MiniCPM5-1B video VQA / captioning hybrid"
+            "Train DINOv3 Perceiver + gated cross-attn Qwen2.5 video VQA / captioning"
         )
     )
     parser.add_argument(
@@ -90,27 +91,33 @@ def parse_args():
         "--adapter-epochs",
         type=int,
         default=2,
-        help="Stage 1: train vision adapter only with LoRA frozen (0 to skip)",
+        help="Stage 1: train resampler + xattn only with LoRA frozen (0 to skip)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=5,
-        help="Stage 2: joint vision adapter + LoRA epochs",
+        help="Stage 2: joint visual pathway + LoRA epochs",
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument(
+        "--xattn-every-n",
+        type=int,
+        default=DEFAULT_XATTN_EVERY_N,
+        help="Insert gated cross-attn every N decoder layers (default: 4)",
+    )
+    parser.add_argument(
         "--llm-lr",
         type=float,
-        default=5e-5,
+        default=1e-5,
         help="LoRA learning rate (joint stage)",
     )
     parser.add_argument(
         "--adapter-lr",
         type=float,
-        default=5e-4,
-        help="Vision adapter learning rate",
+        default=1e-4,
+        help="Resampler + xattn learning rate",
     )
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -205,7 +212,7 @@ def _make_loader(args, tokenizer, split: str, shuffle: bool):
     )
 
 
-def _set_lora_requires_grad(model: DINOv3MiniCPMHybrid, trainable: bool) -> int:
+def _set_lora_requires_grad(model: DINOv3QwenXAttn, trainable: bool) -> int:
     """Enable/disable grads on LoRA parameters. Returns how many were toggled."""
     count = 0
     for name, param in model.llm.named_parameters():
@@ -216,7 +223,7 @@ def _set_lora_requires_grad(model: DINOv3MiniCPMHybrid, trainable: bool) -> int:
 
 
 def build_optimizer(
-    model: DINOv3MiniCPMHybrid,
+    model: DINOv3QwenXAttn,
     adapter_lr: float,
     llm_lr: float | None,
     weight_decay: float,
@@ -314,13 +321,11 @@ def evaluate(
                 max_new_tokens=128,
                 num_beams=1,
             )
-            num_visual = videos.shape[1] * model.tokens_per_frame
             hypotheses.append(
                 decode_generated_answer(
                     tokenizer,
                     gen_ids,
                     prompt_len,
-                    num_visual_tokens=num_visual,
                 )
             )
             references.append(batch["answer"][0])
@@ -405,10 +410,10 @@ def main():
     print(f"Using device: {device}")
     print(f"Dataset: {args.dataset}")
     print(
-        f"Schedule: adapter-only={args.adapter_epochs} epoch(s), "
+        f"Schedule: visual-only={args.adapter_epochs} epoch(s), "
         f"joint={args.epochs} epoch(s), "
         f"adapter_lr={args.adapter_lr}, llm_lr={args.llm_lr}, "
-        f"patience={args.patience}"
+        f"xattn_every_n={args.xattn_every_n}, patience={args.patience}"
     )
     if args.dataset == "vau":
         print(f"Caption prompt: {CAPTION_PROMPT!r}")
@@ -416,6 +421,7 @@ def main():
     model, tokenizer = build_hybrid_model(
         device,
         num_frames=args.num_frames,
+        xattn_every_n=args.xattn_every_n,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
     )
@@ -446,11 +452,11 @@ def main():
 
     global_epoch = 0
     try:
-        # --- Stage 1: vision adapter only ---
+        # --- Stage 1: resampler + xattn only ---
         if args.adapter_epochs > 0:
             n_lora = _set_lora_requires_grad(model, trainable=False)
             print(
-                f"Stage 1: vision adapter only "
+                f"Stage 1: resampler + xattn only "
                 f"({args.adapter_epochs} epoch(s), LoRA frozen={n_lora} tensors)"
             )
             optimizer = build_optimizer(
@@ -467,10 +473,10 @@ def main():
                     train_loader,
                     optimizer,
                     device,
-                    desc=f"Adapter {stage_epoch + 1}/{args.adapter_epochs}",
+                    desc=f"Visual {stage_epoch + 1}/{args.adapter_epochs}",
                 )
                 print(
-                    f"Adapter epoch {stage_epoch + 1}/{args.adapter_epochs}: "
+                    f"Visual epoch {stage_epoch + 1}/{args.adapter_epochs}: "
                     f"train_loss={train_loss:.4f}"
                 )
                 if logger is not None:
@@ -485,7 +491,7 @@ def main():
                     device,
                     logger,
                     epoch_label=(
-                        f"Adapter epoch {stage_epoch + 1}/{args.adapter_epochs}"
+                        f"Visual epoch {stage_epoch + 1}/{args.adapter_epochs}"
                     ),
                     epoch_num=global_epoch,
                     best_loss=best_loss,
@@ -493,11 +499,11 @@ def main():
                     best_dir=best_dir,
                 )
 
-        # --- Stage 2: joint LoRA + adapter ---
+        # --- Stage 2: joint LoRA + visual pathway ---
         if args.epochs > 0:
             n_lora = _set_lora_requires_grad(model, trainable=True)
             print(
-                f"Stage 2: joint adapter + LoRA "
+                f"Stage 2: joint visual + LoRA "
                 f"({args.epochs} epoch(s), LoRA trainable={n_lora} tensors)"
             )
             optimizer = build_optimizer(

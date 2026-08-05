@@ -35,7 +35,7 @@ DEFAULT_CACHE_DIR = "data/VAU-Bench"
 DEFAULT_UCF_DOWNLOAD_DIR = "data/UCF-Crime/hf"
 VALID_SPLITS = {"train", "validation", "val", "test"}
 VALID_SOURCES = {"ucf", "msad", "ecva"}
-CAPTION_PROMPT = "Describe the anomalous event in the video."
+CAPTION_PROMPT = "Describe what happens in the video."
 
 UCF_HF_FOLDERS = (
     "Anomaly-Videos-Part-1",

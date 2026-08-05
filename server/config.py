@@ -25,8 +25,8 @@ class ServerConfig:
     backbone_weights: str = "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
     detr_checkpoint: str = "dinov3/checkpoints/model/detr_decoder.pt"
     anomaly_checkpoint: str = "dinov3/checkpoints/model/anomaly_vau"
-    vqa_checkpoint: str = "dinov3/checkpoints/model/vqa_vau_minicpm_best"
-    vqa_fallback_checkpoint: str = "dinov3/checkpoints/model/vqa_minicpm"
+    vqa_checkpoint: str = "dinov3/checkpoints/model/vqa_vau_qwen_best"
+    vqa_fallback_checkpoint: str = "dinov3/checkpoints/model/vqa_vau_qwen"
 
     img_size: int = 224
     num_frames: int = 16

@@ -1,4 +1,4 @@
-# DINOv3 + MiniCPM5-1B Video VQA / Captioning
+# DINOv3 + Qwen2.5-1.5B Video VQA / Captioning (Flamingo-style)
 
 Supports two datasets:
 
@@ -7,16 +7,21 @@ Supports two datasets:
 2. **VAU-Bench** ([7xiang/VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench)) —
    video-only Description captioning (no dataset question)
 
-Architecture (`video_spatial`):
+Architecture (`video_xattn_v1`):
 
-- **Vision**: frozen DINOv3 ViT-S patch tokens for each sampled frame
-- **Spatial pool**: adaptive avg-pool of the 14×14 patch grid to 4×4 (16 tokens/frame)
-- **Adapter**: linear 384 → 1536, LayerNorm, plus temporal (1D) and spatial (2D) sincos PE
-- **Language**: LoRA-tuned
-  [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B)
+- **Vision**: frozen DINOv3 ViT-S — full per-frame patch tokens (+ CLS)
+- **Resampler**: Perceiver with 64 learned queries, 3 layers, learned temporal
+  embeddings + 2D sincos spatial PE
+- **Language**: frozen
+  [Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
+  with Flamingo-style **tanh-gated cross-attention** inserted every 4th decoder
+  layer (gates init at 0); optional LoRA in training stage 2
+- Visual tokens stay in the cross-attn pathway only (no prefix-concat into the
+  LM context)
 
-Default: 16 frames × 16 pooled tokens = **256** MiniCPM visual prefix tokens.
-CLS-only (`video_cls`) and image-VQA checkpoints are incompatible — retrain required.
+Default: 16 frames → **64** visual latents. Older `video_cls` /
+`video_spatial*` / MiniCPM prefix-concat checkpoints are incompatible — retrain
+required.
 
 ---
 
@@ -90,9 +95,6 @@ Delete archives after extraction if needed:
 rm data/CUVA/raw/group_{0,1,2,3}.zip
 ```
 
-This uses every available video under `video-root`; evaluation is consequently
-performed only on the available subset as well.
-
 By default, files are placed under:
 
 ```text
@@ -108,68 +110,6 @@ data/CUVA/
     .../00002.mp4
 ```
 
-Keep enough free space for both the archives and extracted videos. Delete the
-ZIP files after successful extraction if you need to reclaim space.
-
-#### Direct Hugging Face download
-
-Download a single archive:
-
-```python
-from huggingface_hub import hf_hub_download
-
-zip_path = hf_hub_download(
-    repo_id="fesvhtr/CUVA",
-    repo_type="dataset",
-    filename="raw/group_0.zip",
-    local_dir="data/CUVA",
-)
-print(zip_path)
-```
-
-Download the complete repository:
-
-```python
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    repo_id="fesvhtr/CUVA",
-    repo_type="dataset",
-    local_dir="data/CUVA",
-)
-```
-
-The full snapshot downloads all annotations and archives but does not extract
-the ZIP files. Extract them into one searchable video root:
-
-```bash
-mkdir -p data/CUVA/videos
-for archive in data/CUVA/raw/group_*.zip; do
-  unzip "$archive" -d data/CUVA/videos
-done
-```
-
-### Inspect annotations
-
-No video download is required:
-
-```python
-from heads.vqa.dataset import load_cuva_samples
-
-train = load_cuva_samples("train")
-test = load_cuva_samples("test")
-print(train[0])
-```
-
-Filter specific task types:
-
-```python
-samples = load_cuva_samples(
-    "train",
-    tasks=["Classification", "Cause", "Result"],
-)
-```
-
 ### Train (CUVA)
 
 ```bash
@@ -179,8 +119,8 @@ python -m heads.vqa.train \
   --epochs 5 \
   --batch-size 2 \
   --num-frames 16 \
-  --adapter-lr 5e-4 \
-  --llm-lr 5e-5
+  --adapter-lr 1e-4 \
+  --llm-lr 1e-5
 ```
 
 Download videos automatically before training:
@@ -199,8 +139,8 @@ python -m heads.vqa.train \
 ```
 
 Checkpoints are saved under
-`dinov3/checkpoints/model/vqa_cuva_minicpm/`, with the best eval checkpoint
-under `vqa_cuva_minicpm_best/`.
+`dinov3/checkpoints/model/vqa_cuva_qwen/`, with the best eval checkpoint
+under `vqa_cuva_qwen_best/`.
 
 ### Inference (CUVA)
 
@@ -217,7 +157,7 @@ python -m heads.vqa.inference \
 Video-only captioning: the model does **not** use the VAU-Bench `Question` /
 options. A fixed prompt is used instead:
 
-> Describe the anomalous event in the video.
+> Describe what happens in the video.
 
 Training targets the `Description` column. Frames are trimmed to
 `[Start Time, End Time]` when both values are ≥ 0; `-1` means use the full
@@ -272,18 +212,12 @@ data/VAU-Bench/
     ucf_Abuse001_x264.mp4    # staged (symlink or copy)
 ```
 
-Use `--copy` with `--download-ucf` if the destination must be self-contained
-instead of symlinks. Optional legacy staging from a local extract:
-
-```bash
-python -m heads.vqa.vau_dataset --stage-ucf /path/to/extracted/ucf
-```
-
 ### Train (VAU Description)
 
 Defaults to UCF-only when `--dataset vau`. Training is **two-stage** by default:
-vision adapter only (`--adapter-epochs`, LoRA frozen), then joint adapter + LoRA
-(`--epochs`) with early stopping (`--patience`).
+
+1. Resampler + gated cross-attn only (`--adapter-epochs`, LoRA frozen, lr `1e-4`)
+2. Joint visual pathway + LoRA (`--epochs`, LoRA lr `1e-5`) with early stopping
 
 ```bash
 python -m heads.vqa.train \
@@ -294,13 +228,15 @@ python -m heads.vqa.train \
   --epochs 5 \
   --batch-size 2 \
   --num-frames 16 \
-  --adapter-lr 5e-4 \
-  --llm-lr 5e-5 \
+  --adapter-lr 1e-4 \
+  --llm-lr 1e-5 \
   --patience 2 \
   --eval-samples 4
 ```
 
-Skip stage 1 with `--adapter-epochs 0`. Checkpoints default to `dinov3/checkpoints/model/vqa_vau_minicpm/`.
+On MPS, consider a sparser cross-attn insert for memory, e.g. `--xattn-every-n 6`.
+
+Skip stage 1 with `--adapter-epochs 0`. Checkpoints default to `dinov3/checkpoints/model/vqa_vau_qwen/`.
 
 ### Inference (VAU Description)
 
@@ -308,7 +244,7 @@ Skip stage 1 with `--adapter-epochs 0`. Checkpoints default to `dinov3/checkpoin
 python -m heads.vqa.inference \
   --video data/VAU-Bench/videos/ucf_Abuse001_x264.mp4 \
   --no-question \
-  --checkpoint dinov3/checkpoints/model/vqa_vau_minicpm \
+  --checkpoint dinov3/checkpoints/model/vqa_vau_qwen \
   --start-sec 23 \
   --end-sec 31
 ```
@@ -323,7 +259,7 @@ from heads.vqa.inference import run_inference
 answer = run_inference(
     video_path="data/VAU-Bench/videos/ucf_Abuse001_x264.mp4",
     question=None,  # uses fixed caption prompt
-    checkpoint_dir="dinov3/checkpoints/model/vqa_vau_minicpm",
+    checkpoint_dir="dinov3/checkpoints/model/vqa_vau_qwen",
     start_sec=23,
     end_sec=31,
 )
@@ -351,9 +287,14 @@ See [`logger/README.md`](../../logger/README.md) for the schema and SQL queries.
 
 ```bash
 python -m py_compile \
+  heads/vqa/llm_loader.py \
+  heads/vqa/resampler.py \
+  heads/vqa/gated_xattn.py \
   heads/vqa/dataset.py \
   heads/vqa/vau_dataset.py \
   heads/vqa/model.py \
   heads/vqa/train.py \
   heads/vqa/inference.py
+
+python -m heads.vqa.model   # smoke: encode + forward loss on device
 ```

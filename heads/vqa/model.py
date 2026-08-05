@@ -1,8 +1,11 @@
+"""DINOv3 + Qwen2.5 Flamingo-style video VQA (gated cross-attention)."""
+
+from __future__ import annotations
+
 from pathlib import Path
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from dinov3.checkpoints.load import (
     ensure_backbone_checkpoint,
@@ -10,113 +13,94 @@ from dinov3.checkpoints.load import (
     validate_checkpoint_file,
 )
 from dinov3.models import vit_small
-from heads.vqa.minicpm_loader import (
-    MINICPM_MODEL_NAME,
-    load_minicpm_llm,
-    load_minicpm_tokenizer,
+from heads.vqa.gated_xattn import (
+    VisualFeatureHolder,
+    build_gated_blocks,
+    count_xattn_slots,
+    wrap_decoder_layers,
 )
+from heads.vqa.llm_loader import (
+    LLM_MODEL_NAME,
+    get_decoder_layers,
+    load_llm,
+    load_llm_tokenizer,
+)
+from heads.vqa.resampler import PerceiverResampler
 
 BACKBONE_WEIGHTS = "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
-DEFAULT_CHECKPOINT_DIR = "dinov3/checkpoints/model/vqa_cuva_minicpm"
+DEFAULT_CHECKPOINT_DIR = "dinov3/checkpoints/model/vqa_cuva_qwen"
 VISION_DIM = 384
 LLM_DIM = 1536
 IMG_SIZE = 224
 PATCH_SIZE = 16
 DEFAULT_NUM_FRAMES = 16
-DEFAULT_SPATIAL_POOL = 4
-ARCHITECTURE = "video_spatial"
+DEFAULT_NUM_LATENTS = 64
+DEFAULT_RESAMPLER_DEPTH = 3
+DEFAULT_XATTN_EVERY_N = 4
+DEFAULT_NUM_HEADS = 12  # 1536 / 12 = 128
+ARCHITECTURE = "video_xattn_v1"
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def build_1d_sincos_pos_embed(num_positions: int, dim: int) -> torch.Tensor:
-    """Sinusoidal 1D position encoding: (1, N, dim)."""
-    assert dim % 2 == 0, "pos embed dim must be even"
-    position = torch.arange(num_positions, dtype=torch.float32).unsqueeze(1)
-    omega = torch.arange(dim // 2, dtype=torch.float32) / (dim // 2)
-    omega = 1.0 / (10000**omega)
-    angles = position * omega.unsqueeze(0)
-    pos = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
-    return pos.unsqueeze(0)
+def imagenet_normalize(videos: torch.Tensor) -> torch.Tensor:
+    """Apply ImageNet mean/std to video/image tensors in [0, 1]."""
+    if videos.dim() == 5:
+        shape = (1, 1, 3, 1, 1)
+    elif videos.dim() == 4:
+        shape = (1, 3, 1, 1)
+    elif videos.dim() == 3:
+        shape = (3, 1, 1)
+    else:
+        raise ValueError(f"Expected 3D/4D/5D tensor, got shape {tuple(videos.shape)}")
+    mean = videos.new_tensor(IMAGENET_MEAN).view(*shape)
+    std = videos.new_tensor(IMAGENET_STD).view(*shape)
+    return (videos - mean) / std
 
 
-def build_2d_sincos_pos_embed(height: int, width: int, dim: int) -> torch.Tensor:
-    """Sinusoidal 2D spatial position encoding: (1, H*W, dim)."""
-    assert dim % 4 == 0, "pos embed dim must be divisible by 4 for 2D"
-    half = dim // 2
-    grid_y = torch.arange(height, dtype=torch.float32)
-    grid_x = torch.arange(width, dtype=torch.float32)
-    # meshgrid indexing='ij' → (H, W)
-    gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
-    omega = torch.arange(half // 2, dtype=torch.float32) / (half // 2)
-    omega = 1.0 / (10000**omega)
-
-    def _encode(coord: torch.Tensor) -> torch.Tensor:
-        # coord: (H, W) → (H*W, half)
-        flat = coord.reshape(-1, 1)
-        angles = flat * omega.unsqueeze(0)
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
-
-    pos = torch.cat([_encode(gy), _encode(gx)], dim=1)
-    return pos.unsqueeze(0)
-
-
-class DINOv3MiniCPMHybrid(nn.Module):
-    """Video VQA: spatially pooled DINOv3 patch tokens → MiniCPM visual prefix."""
+class DINOv3QwenXAttn(nn.Module):
+    """Video VQA: DINOv3 patches → Perceiver → gated cross-attn into Qwen."""
 
     def __init__(
         self,
         vision_model: nn.Module,
         llm: nn.Module,
+        resampler: PerceiverResampler,
+        xattn_blocks: nn.ModuleList,
+        holder: VisualFeatureHolder,
         num_frames: int = DEFAULT_NUM_FRAMES,
-        spatial_pool: int = DEFAULT_SPATIAL_POOL,
+        xattn_every_n: int = DEFAULT_XATTN_EVERY_N,
         vision_dim: int = VISION_DIM,
         llm_dim: int = LLM_DIM,
         patch_size: int = PATCH_SIZE,
         img_size: int = IMG_SIZE,
+        xattn_layer_indices: list[int] | None = None,
     ):
         super().__init__()
         self.vision_model = vision_model
         self.llm = llm
+        self.resampler = resampler
+        self.xattn_blocks = xattn_blocks
+        self.holder = holder
         self.num_frames = num_frames
-        self.spatial_pool = spatial_pool
-        self.tokens_per_frame = spatial_pool * spatial_pool
-        self.num_visual_tokens = num_frames * self.tokens_per_frame
+        self.xattn_every_n = xattn_every_n
+        self.num_visual_tokens = resampler.num_latents
         self.llm_dim = llm_dim
+        self.vision_dim = vision_dim
         self.patch_size = patch_size
         self.img_size = img_size
         self.grid_size = img_size // patch_size
-
-        self.vision_projection = nn.Linear(vision_dim, llm_dim)
-        self.projection_norm = nn.LayerNorm(llm_dim)
-        self.register_buffer(
-            "_temporal_pos", build_1d_sincos_pos_embed(num_frames, llm_dim)
-        )
-        self.register_buffer(
-            "_spatial_pos",
-            build_2d_sincos_pos_embed(spatial_pool, spatial_pool, llm_dim),
-        )
-
-    def _llm_dtype(self) -> torch.dtype:
-        return next(self.llm.parameters()).dtype
-
-    def _get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.llm.get_input_embeddings()(input_ids)
-
-    def _temporal_pe(self, num_frames: int, device: torch.device, dtype: torch.dtype):
-        if num_frames <= self._temporal_pos.shape[1]:
-            return self._temporal_pos[:, :num_frames, :].to(device=device, dtype=dtype)
-        return build_1d_sincos_pos_embed(num_frames, self.llm_dim).to(
-            device=device, dtype=dtype
-        )
+        self.xattn_layer_indices = list(xattn_layer_indices or [])
 
     def encode_visual(self, videos: torch.Tensor) -> torch.Tensor:
         """
-        Encode videos into ordered spatially pooled visual prefix tokens.
+        Encode videos into fixed Perceiver latents.
 
         Args:
-            videos: [B, T, 3, H, W] or [B, 3, H, W] (single-frame fallback)
+            videos: [B, T, 3, H, W] or [B, 3, H, W] in [0, 1]
 
         Returns:
-            visual_embeds: [B, T * spatial_pool^2, llm_dim]
+            visual_embeds: [B, num_latents, llm_dim]
         """
         if videos.dim() == 4:
             videos = videos.unsqueeze(1)
@@ -127,87 +111,46 @@ class DINOv3MiniCPMHybrid(nn.Module):
 
         batch_size, num_frames, channels, height, width = videos.shape
         if height != width:
-            raise ValueError(
-                f"Expected square frames, got HxW={height}x{width}"
-            )
+            raise ValueError(f"Expected square frames, got HxW={height}x{width}")
         grid = height // self.patch_size
         if grid * self.patch_size != height:
             raise ValueError(
                 f"Frame size {height} must be divisible by patch size {self.patch_size}"
             )
 
+        videos = imagenet_normalize(videos)
         flat = videos.reshape(batch_size * num_frames, channels, height, width)
 
         with torch.no_grad():
             features = self.vision_model(flat, masks=None, is_training=True)
+            cls_tokens = features["x_norm_clstoken"]
             patch_tokens = features["x_norm_patchtokens"]
 
-        # [B*T, N, D] → [B*T, D, H, W] for adaptive pool
         _, num_patches, dim = patch_tokens.shape
         if num_patches != grid * grid:
-            raise ValueError(
-                f"Expected {grid * grid} patch tokens, got {num_patches}"
-            )
-        patches = patch_tokens.transpose(1, 2).reshape(
-            batch_size * num_frames, dim, grid, grid
-        )
-        pooled = F.adaptive_avg_pool2d(
-            patches, output_size=(self.spatial_pool, self.spatial_pool)
-        )
-        # [B*T, D, S, S] → [B, T, S*S, D]
-        pooled = pooled.flatten(2).transpose(1, 2)
-        pooled = pooled.view(
-            batch_size, num_frames, self.tokens_per_frame, dim
-        )
+            raise ValueError(f"Expected {grid * grid} patch tokens, got {num_patches}")
 
-        projected = self.projection_norm(self.vision_projection(pooled))
+        patches = patch_tokens.view(batch_size, num_frames, num_patches, dim)
+        cls = cls_tokens.view(batch_size, num_frames, dim)
+        return self.resampler(patches, cls_tokens=cls)
 
-        temporal = self._temporal_pe(
-            num_frames, projected.device, projected.dtype
-        )
-        # (1, T, 1, D) broadcast over spatial tokens
-        temporal = temporal.unsqueeze(2)
-        spatial = self._spatial_pos.to(device=projected.device, dtype=projected.dtype)
-        # (1, 1, S*S, D) broadcast over time
-        spatial = spatial.unsqueeze(1)
-
-        encoded = projected + temporal + spatial
-        return encoded.reshape(batch_size, num_frames * self.tokens_per_frame, -1)
-
-    def _merge_visual_and_text(
+    def _run_llm(
         self,
         visual_embeds: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         labels: torch.Tensor | None,
     ):
-        text_embeds = self._get_text_embeddings(input_ids)
-        visual_embeds = visual_embeds.to(dtype=text_embeds.dtype)
-        inputs_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
-
-        batch_size, visual_len, _ = visual_embeds.shape
-        visual_mask = torch.ones(
-            batch_size,
-            visual_len,
-            device=inputs_embeds.device,
-            dtype=attention_mask.dtype if attention_mask is not None else torch.long,
-        )
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                input_ids.shape, device=input_ids.device, dtype=torch.long
+        self.holder.set(visual_embeds)
+        try:
+            return self.llm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                return_dict=True,
             )
-        attention_mask = torch.cat([visual_mask, attention_mask], dim=1)
-
-        if labels is not None:
-            visual_labels = torch.full(
-                (batch_size, visual_len),
-                -100,
-                device=labels.device,
-                dtype=labels.dtype,
-            )
-            labels = torch.cat([visual_labels, labels], dim=1)
-
-        return inputs_embeds, attention_mask, labels
+        finally:
+            self.holder.clear()
 
     def forward(
         self,
@@ -217,15 +160,7 @@ class DINOv3MiniCPMHybrid(nn.Module):
         labels: torch.Tensor | None = None,
     ):
         visual_embeds = self.encode_visual(videos)
-        inputs_embeds, attention_mask, labels = self._merge_visual_and_text(
-            visual_embeds, input_ids, attention_mask, labels
-        )
-        return self.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels,
-            return_dict=True,
-        )
+        return self._run_llm(visual_embeds, input_ids, attention_mask, labels)
 
     @torch.no_grad()
     def generate(
@@ -237,24 +172,13 @@ class DINOv3MiniCPMHybrid(nn.Module):
         num_beams: int = 1,
     ) -> torch.Tensor:
         visual_embeds = self.encode_visual(videos)
-        inputs_embeds, attention_mask, _ = self._merge_visual_and_text(
-            visual_embeds, input_ids, attention_mask, labels=None
-        )
-        visual_len = visual_embeds.shape[1]
-        visual_placeholders = torch.zeros(
-            input_ids.shape[0],
-            visual_len,
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-        full_input_ids = torch.cat([visual_placeholders, input_ids], dim=1)
+        self.holder.set(visual_embeds)
         was_gc = getattr(self.llm, "is_gradient_checkpointing", False)
         if was_gc and hasattr(self.llm, "gradient_checkpointing_disable"):
             self.llm.gradient_checkpointing_disable()
         try:
             return self.llm.generate(
-                input_ids=full_input_ids,
-                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
@@ -262,31 +186,41 @@ class DINOv3MiniCPMHybrid(nn.Module):
                 use_cache=True,
             )
         finally:
+            self.holder.clear()
             if was_gc and hasattr(self.llm, "gradient_checkpointing_enable"):
                 self.llm.gradient_checkpointing_enable()
+
+
+# Backward-compatible alias for callers that still import the old name.
+DINOv3MiniCPMHybrid = DINOv3QwenXAttn
 
 
 def decode_generated_answer(
     tokenizer,
     gen_ids: torch.Tensor,
     prompt_len: int,
-    num_visual_tokens: int = DEFAULT_NUM_FRAMES * DEFAULT_SPATIAL_POOL * DEFAULT_SPATIAL_POOL,
+    num_visual_tokens: int = 0,
 ) -> str:
-    start = num_visual_tokens + prompt_len
-    new_tokens = gen_ids[0, start:]
+    """Decode newly generated tokens. Visual tokens are not in the id sequence."""
+    del num_visual_tokens  # unused; kept for call-site compatibility
+    new_tokens = gen_ids[0, prompt_len:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
 def build_hybrid_model(
     device: torch.device,
-    llm_model_name: str = MINICPM_MODEL_NAME,
+    llm_model_name: str = LLM_MODEL_NAME,
     backbone_weights: str = BACKBONE_WEIGHTS,
     num_frames: int = DEFAULT_NUM_FRAMES,
-    spatial_pool: int = DEFAULT_SPATIAL_POOL,
+    num_latents: int = DEFAULT_NUM_LATENTS,
+    resampler_depth: int = DEFAULT_RESAMPLER_DEPTH,
+    xattn_every_n: int = DEFAULT_XATTN_EVERY_N,
+    num_heads: int = DEFAULT_NUM_HEADS,
     lora_r: int = 16,
     lora_alpha: int = 32,
     adapter_path: str | None = None,
     vision_model: nn.Module | None = None,
+    apply_lora: bool = True,
 ):
     if vision_model is None:
         vision_model = vit_small(
@@ -310,57 +244,88 @@ def build_hybrid_model(
         for param in vision_model.parameters():
             param.requires_grad = False
 
-    llm = load_minicpm_llm(
+    llm = load_llm(
         device,
         model_name=llm_model_name,
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         adapter_path=adapter_path,
+        apply_lora=apply_lora,
     )
 
-    model = DINOv3MiniCPMHybrid(
+    num_layers = len(get_decoder_layers(llm))
+    num_blocks = count_xattn_slots(num_layers, xattn_every_n)
+    holder = VisualFeatureHolder()
+    xattn_blocks = build_gated_blocks(num_blocks, LLM_DIM, num_heads)
+    xattn_blocks.to(device)
+    indices = wrap_decoder_layers(llm, xattn_blocks, holder, every_n=xattn_every_n)
+
+    grid_size = IMG_SIZE // PATCH_SIZE
+    resampler = PerceiverResampler(
+        vision_dim=VISION_DIM,
+        llm_dim=LLM_DIM,
+        num_latents=num_latents,
+        depth=resampler_depth,
+        num_heads=num_heads,
+        max_frames=max(num_frames, 32),
+        grid_size=grid_size,
+        include_cls=True,
+    ).to(device)
+
+    model = DINOv3QwenXAttn(
         vision_model=vision_model,
         llm=llm,
+        resampler=resampler,
+        xattn_blocks=xattn_blocks,
+        holder=holder,
         num_frames=num_frames,
-        spatial_pool=spatial_pool,
+        xattn_every_n=xattn_every_n,
+        xattn_layer_indices=indices,
     ).to(device)
 
     if hasattr(model.llm, "enable_input_require_grads"):
         model.llm.enable_input_require_grads()
 
-    tokenizer = load_minicpm_tokenizer(llm_model_name)
+    tokenizer = load_llm_tokenizer(llm_model_name)
     return model, tokenizer
 
 
-def adapter_trainable_params(model: DINOv3MiniCPMHybrid):
+def visual_params(model: DINOv3QwenXAttn):
+    """Trainable visual pathway: resampler + gated cross-attention blocks."""
+    return list(model.resampler.parameters()) + list(model.xattn_blocks.parameters())
+
+
+def vision_adapter_params(model: DINOv3QwenXAttn):
+    """Alias kept for train.py compatibility."""
+    return visual_params(model)
+
+
+def adapter_trainable_params(model: DINOv3QwenXAttn):
     return [p for p in model.llm.parameters() if p.requires_grad]
 
 
-def vision_adapter_params(model: DINOv3MiniCPMHybrid):
-    return list(model.vision_projection.parameters()) + list(
-        model.projection_norm.parameters()
-    )
-
-
-def save_hybrid_checkpoint(model: DINOv3MiniCPMHybrid, checkpoint_dir: str) -> None:
+def save_hybrid_checkpoint(model: DINOv3QwenXAttn, checkpoint_dir: str) -> None:
     path = Path(checkpoint_dir)
     path.mkdir(parents=True, exist_ok=True)
-    model.llm.save_pretrained(path / "adapter")
+    if hasattr(model.llm, "save_pretrained"):
+        model.llm.save_pretrained(path / "adapter")
     torch.save(
         {
-            "vision_projection": model.vision_projection.state_dict(),
-            "projection_norm": model.projection_norm.state_dict(),
+            "resampler": model.resampler.state_dict(),
+            "xattn_blocks": model.xattn_blocks.state_dict(),
             "num_frames": model.num_frames,
-            "spatial_pool": model.spatial_pool,
+            "num_latents": model.num_visual_tokens,
             "num_visual_tokens": model.num_visual_tokens,
+            "xattn_every_n": model.xattn_every_n,
+            "xattn_layer_indices": model.xattn_layer_indices,
             "architecture": ARCHITECTURE,
         },
-        path / "vision_adapter.pt",
+        path / "visual_head.pt",
     )
 
 
 def load_hybrid_checkpoint(
-    model: DINOv3MiniCPMHybrid,
+    model: DINOv3QwenXAttn,
     checkpoint_dir: str,
     device: torch.device,
     trainable_adapter: bool = False,
@@ -369,27 +334,30 @@ def load_hybrid_checkpoint(
 
     path = Path(checkpoint_dir)
     adapter_dir = path / "adapter"
-    vision_path = path / "vision_adapter.pt"
+    visual_path = path / "visual_head.pt"
+    # Legacy prefix-concat adapters are not compatible.
+    legacy_path = path / "vision_adapter.pt"
 
     if adapter_dir.exists():
         if isinstance(model.llm, PeftModel):
             base_model = model.llm.get_base_model()
         else:
             base_model = model.llm
+        # Decoder layers are already xattn-wrapped on the base; do not wrap again.
         model.llm = PeftModel.from_pretrained(
             base_model,
             str(adapter_dir),
             is_trainable=trainable_adapter,
         ).to(device)
 
-    if vision_path.exists():
-        state = torch.load(vision_path, map_location=device, weights_only=True)
+    if visual_path.exists():
+        state = torch.load(visual_path, map_location=device, weights_only=True)
         arch = state.get("architecture")
         if arch != ARCHITECTURE:
             raise RuntimeError(
                 f"Checkpoint at {checkpoint_dir} has architecture={arch!r}, "
-                f"expected {ARCHITECTURE!r}. CLS-only (video_cls) and other "
-                "adapters are not compatible; retrain with the spatial encoder."
+                f"expected {ARCHITECTURE!r}. Older video_spatial_* / MiniCPM "
+                "adapters are not compatible; retrain with video_xattn_v1."
             )
         ckpt_frames = state.get("num_frames")
         if ckpt_frames is not None and int(ckpt_frames) != model.num_frames:
@@ -397,33 +365,35 @@ def load_hybrid_checkpoint(
                 f"Warning: checkpoint num_frames={ckpt_frames} != model "
                 f"num_frames={model.num_frames}; using model setting."
             )
-        ckpt_pool = state.get("spatial_pool")
-        if ckpt_pool is not None and int(ckpt_pool) != model.spatial_pool:
+        ckpt_latents = state.get("num_latents", state.get("num_visual_tokens"))
+        if ckpt_latents is not None and int(ckpt_latents) != model.num_visual_tokens:
             raise RuntimeError(
-                f"Checkpoint spatial_pool={ckpt_pool} != model "
-                f"spatial_pool={model.spatial_pool}."
+                f"Checkpoint num_latents={ckpt_latents} != model "
+                f"num_latents={model.num_visual_tokens}."
             )
-        model.vision_projection.load_state_dict(state["vision_projection"])
-        model.projection_norm.load_state_dict(state["projection_norm"])
+        model.resampler.load_state_dict(state["resampler"])
+        model.xattn_blocks.load_state_dict(state["xattn_blocks"])
+        return
+
+    if legacy_path.exists():
+        raise RuntimeError(
+            f"Found legacy vision_adapter.pt at {checkpoint_dir} "
+            f"(expected {ARCHITECTURE} visual_head.pt). Retrain required."
+        )
+    raise FileNotFoundError(f"No visual_head.pt found under {checkpoint_dir}")
 
 
 if __name__ == "__main__":
     from dinov3.utils.device import get_device
-    from heads.vqa.minicpm_loader import tokenize_chat_pair
+    from heads.vqa.llm_loader import tokenize_chat_pair
 
     device = get_device()
     num_frames = DEFAULT_NUM_FRAMES
     model, tokenizer = build_hybrid_model(device, num_frames=num_frames)
 
-    videos = torch.randn(2, num_frames, 3, IMG_SIZE, IMG_SIZE, device=device)
-    questions = [
-        "Does this video contain any potentially violent or criminal activities?",
-        "What type of abnormal event is present in the video?",
-    ]
-    answers = [
-        "Yes, a fight is taking place near the entrance.",
-        "Fighting between two people in a hallway.",
-    ]
+    videos = torch.randn(1, num_frames, 3, IMG_SIZE, IMG_SIZE, device=device)
+    questions = ["Describe what happens in the video."]
+    answers = ["A person approaches another and starts a fight near a doorway."]
 
     input_ids = []
     labels = []
@@ -434,9 +404,9 @@ if __name__ == "__main__":
 
     max_len = max(len(row) for row in input_ids)
     pad_id = tokenizer.pad_token_id
-    input_ids_t = torch.full((2, max_len), pad_id, dtype=torch.long, device=device)
-    labels_t = torch.full((2, max_len), -100, dtype=torch.long, device=device)
-    attn = torch.zeros((2, max_len), dtype=torch.long, device=device)
+    input_ids_t = torch.full((1, max_len), pad_id, dtype=torch.long, device=device)
+    labels_t = torch.full((1, max_len), -100, dtype=torch.long, device=device)
+    attn = torch.zeros((1, max_len), dtype=torch.long, device=device)
     for i, (ids, lbls) in enumerate(zip(input_ids, labels)):
         input_ids_t[i, : len(ids)] = torch.tensor(ids, device=device)
         labels_t[i, : len(lbls)] = torch.tensor(lbls, device=device)
@@ -445,7 +415,8 @@ if __name__ == "__main__":
     visual = model.encode_visual(videos)
     print("visual_embeds:", tuple(visual.shape))
     print("num_visual_tokens:", model.num_visual_tokens)
+    print("xattn layers:", model.xattn_layer_indices)
     out = model(videos, input_ids_t, attn, labels=labels_t)
-    print("loss:", out.loss.item())
+    print("loss:", float(out.loss.detach().cpu()))
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable / 1e6:.1f}M")

@@ -25,7 +25,7 @@ from heads.anomaly.model import (
 from heads.detr.transformer import build_detr
 from heads.vqa.inference import resolve_vqa_checkpoint
 from heads.vqa.model import (
-    DINOv3MiniCPMHybrid,
+    DINOv3QwenXAttn,
     build_hybrid_model,
     load_hybrid_checkpoint,
 )
@@ -41,7 +41,7 @@ class ModelRuntime:
     detr: nn.Module
     anomaly: DINOv3AnomalyClassifier | None = None
     anomaly_id2label: dict[int, str] = field(default_factory=dict)
-    vqa: DINOv3MiniCPMHybrid | None = None
+    vqa: DINOv3QwenXAttn | None = None
     vqa_tokenizer: Any = None
     vqa_num_frames: int = 16
     config: ServerConfig | None = None
@@ -103,17 +103,18 @@ def _resolve_vqa_dir(cfg: ServerConfig) -> Path | None:
 
 
 def _peek_vqa_num_frames(checkpoint_dir: Path, default: int) -> int:
-    vision_path = checkpoint_dir / "vision_adapter.pt"
-    if not vision_path.exists():
+    visual_path = checkpoint_dir / "visual_head.pt"
+    legacy_path = checkpoint_dir / "vision_adapter.pt"
+    path = visual_path if visual_path.exists() else legacy_path
+    if not path.exists():
         return default
     try:
-        state = torch.load(vision_path, map_location="cpu", weights_only=True)
-        # Prefer num_frames only: num_visual_tokens is T * spatial_pool^2.
+        state = torch.load(path, map_location="cpu", weights_only=True)
         frames = state.get("num_frames")
         if frames is not None:
             return int(frames)
     except Exception:
-        logger.exception("Could not read num_frames from %s", vision_path)
+        logger.exception("Could not read num_frames from %s", path)
     return default
 
 
@@ -154,7 +155,7 @@ def load_runtime(cfg: ServerConfig) -> ModelRuntime:
             cfg.anomaly_checkpoint,
         )
 
-    vqa: DINOv3MiniCPMHybrid | None = None
+    vqa: DINOv3QwenXAttn | None = None
     tokenizer = None
     vqa_num_frames = cfg.num_frames
     if cfg.load_vqa:

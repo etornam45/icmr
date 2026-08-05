@@ -12,14 +12,14 @@ from heads.vqa.dataset import (
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
     IMG_SIZE,
-    DINOv3MiniCPMHybrid,
+    DINOv3QwenXAttn,
     build_hybrid_model,
     decode_generated_answer,
     load_hybrid_checkpoint,
 )
 from heads.vqa.vau_dataset import CAPTION_PROMPT
 
-VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_minicpm"
+VAU_CHECKPOINT = "dinov3/checkpoints/model/vqa_vau_qwen"
 
 
 def resolve_vqa_checkpoint(checkpoint_dir: str | Path) -> Path:
@@ -32,7 +32,7 @@ def resolve_vqa_checkpoint(checkpoint_dir: str | Path) -> Path:
 
 @torch.no_grad()
 def generate_caption(
-    model: DINOv3MiniCPMHybrid,
+    model: DINOv3QwenXAttn,
     tokenizer: PreTrainedTokenizer,
     videos: torch.Tensor,
     question: str | None = None,
@@ -55,12 +55,7 @@ def generate_caption(
         max_new_tokens=max_new_tokens,
         num_beams=1,
     )
-    return decode_generated_answer(
-        tokenizer,
-        gen_ids,
-        prompt_len,
-        num_visual_tokens=videos.shape[1] * model.tokens_per_frame,
-    )
+    return decode_generated_answer(tokenizer, gen_ids, prompt_len)
 
 
 def run_inference(
@@ -71,7 +66,7 @@ def run_inference(
     checkpoint_dir: str = DEFAULT_CHECKPOINT_DIR,
     start_sec: float | None = None,
     end_sec: float | None = None,
-    model: DINOv3MiniCPMHybrid | None = None,
+    model: DINOv3QwenXAttn | None = None,
     tokenizer: PreTrainedTokenizer | None = None,
 ) -> str:
     device = get_device()

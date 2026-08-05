@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import PreTrainedTokenizer
 
 from heads.detr.dataset import letterbox
-from heads.vqa.minicpm_loader import apply_chat, tokenize_chat_pair
+from heads.vqa.llm_loader import apply_chat, tokenize_chat_pair
 
 HF_REPO_ID = "fesvhtr/CUVA"
 DEFAULT_CACHE_DIR = "data/CUVA"
