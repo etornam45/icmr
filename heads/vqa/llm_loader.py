@@ -74,7 +74,8 @@ def _local_files_only(
     return _snapshot_dir(model_name, require_tokenizer=require_tokenizer) is not None
 
 
-def _model_dtype(device: torch.device) -> torch.dtype:
+def model_dtype(device: torch.device) -> torch.dtype:
+    """Compute dtype for the causal LM and LLM-facing visual modules."""
     if device.type == "cuda":
         return torch.bfloat16
     if device.type == "mps":
@@ -111,7 +112,7 @@ def load_llm(
 ) -> nn.Module:
     source = _pretrained_source(model_name, require_tokenizer=False)
     local_only = _local_files_only(model_name, require_tokenizer=False)
-    dtype = _model_dtype(device)
+    dtype = model_dtype(device)
 
     if local_only and adapter_path is None:
         print(f"Loading {model_name} from local cache: {source}")

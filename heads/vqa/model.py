@@ -24,6 +24,7 @@ from heads.vqa.llm_loader import (
     get_decoder_layers,
     load_llm,
     load_llm_tokenizer,
+    model_dtype,
 )
 from heads.vqa.resampler import PerceiverResampler
 
@@ -253,11 +254,12 @@ def build_hybrid_model(
         apply_lora=apply_lora,
     )
 
+    llm_dtype = model_dtype(device)
     num_layers = len(get_decoder_layers(llm))
     num_blocks = count_xattn_slots(num_layers, xattn_every_n)
     holder = VisualFeatureHolder()
     xattn_blocks = build_gated_blocks(num_blocks, LLM_DIM, num_heads)
-    xattn_blocks.to(device)
+    xattn_blocks.to(device=device, dtype=llm_dtype)
     indices = wrap_decoder_layers(llm, xattn_blocks, holder, every_n=xattn_every_n)
 
     grid_size = IMG_SIZE // PATCH_SIZE
@@ -385,11 +387,17 @@ def load_hybrid_checkpoint(
 
 if __name__ == "__main__":
     from dinov3.utils.device import get_device
-    from heads.vqa.llm_loader import tokenize_chat_pair
+    from heads.vqa.llm_loader import model_dtype, tokenize_chat_pair
 
     device = get_device()
     num_frames = DEFAULT_NUM_FRAMES
+    expected_dtype = model_dtype(device)
     model, tokenizer = build_hybrid_model(device, num_frames=num_frames)
+
+    xattn_param = next(model.xattn_blocks.parameters())
+    assert xattn_param.dtype == expected_dtype, (
+        f"xattn dtype {xattn_param.dtype} != LLM dtype {expected_dtype}"
+    )
 
     videos = torch.randn(1, num_frames, 3, IMG_SIZE, IMG_SIZE, device=device)
     questions = ["Describe what happens in the video."]
@@ -420,3 +428,29 @@ if __name__ == "__main__":
     print("loss:", float(out.loss.detach().cpu()))
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable / 1e6:.1f}M")
+
+    # Stage 1-like smoke: frozen LoRA + gradient checkpointing + backward.
+    for name, param in model.llm.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = False
+    if hasattr(model.llm, "gradient_checkpointing_enable"):
+        model.llm.gradient_checkpointing_enable()
+
+    model.train()
+    model.vision_model.eval()
+    out = model(videos, input_ids_t, attn, labels=labels_t)
+    assert torch.isfinite(out.loss), f"non-finite loss: {out.loss}"
+    out.loss.backward()
+
+    resampler_grads = sum(
+        1 for param in model.resampler.parameters() if param.grad is not None
+    )
+    xattn_grads = sum(
+        1 for param in model.xattn_blocks.parameters() if param.grad is not None
+    )
+    assert resampler_grads > 0, "expected resampler gradients in Stage 1 smoke test"
+    assert xattn_grads > 0, "expected xattn gradients in Stage 1 smoke test"
+    print(
+        f"Stage 1 smoke OK: resampler grads={resampler_grads}, "
+        f"xattn grads={xattn_grads}"
+    )

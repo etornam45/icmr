@@ -52,16 +52,20 @@ class GatedCrossAttentionBlock(nn.Module):
         self.gate_ffn = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: torch.Tensor, visual: torch.Tensor) -> torch.Tensor:
-        # Match dtype (bf16 LM vs fp32 gates on some devices).
-        visual = visual.to(dtype=x.dtype)
+        # Align hidden states and visual tokens with block weights (bf16 LM vs fp32 init).
+        compute_dtype = self.ln_attn.weight.dtype
+        x = x.to(dtype=compute_dtype)
+        visual = visual.to(dtype=compute_dtype)
         q = self.ln_attn(x)
         kv = self.ln_visual(visual)
         # Broadcast visual batch if needed (shouldn't happen in practice).
         if kv.shape[0] == 1 and q.shape[0] > 1:
             kv = kv.expand(q.shape[0], -1, -1)
         attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
-        x = x + torch.tanh(self.gate_attn).to(dtype=x.dtype) * attn_out
-        x = x + torch.tanh(self.gate_ffn).to(dtype=x.dtype) * self.ffn(self.ln_ffn(x))
+        x = x + torch.tanh(self.gate_attn).to(dtype=compute_dtype) * attn_out
+        x = x + torch.tanh(self.gate_ffn).to(dtype=compute_dtype) * self.ffn(
+            self.ln_ffn(x)
+        )
         return x
 
 

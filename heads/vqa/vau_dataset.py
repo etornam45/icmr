@@ -168,7 +168,7 @@ def collect_vau_ucf_basenames(
             split, cache_dir=cache_dir, dedup_by_video=True, sources="ucf"
         ):
             name = Path(sample["video_name"]).name
-            bare = name[4:] if name.startswith("ucf_") else name
+            bare = name.removeprefix("ucf_")
             names.add(bare)
     return names
 
