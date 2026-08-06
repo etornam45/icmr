@@ -1,4 +1,4 @@
-"""VAU-Bench Anomaly Class dataset wrappers."""
+"""VAU-Bench Anomaly Class dataset wrappers (video-level labels for WTAL)."""
 
 from __future__ import annotations
 
@@ -25,6 +25,11 @@ __all__ = [
     "resolve_vau_samples",
     "build_train_label_maps",
 ]
+
+
+# Note: VAU UCF train/val have no temporal spans. Frame sampling uses the full
+# video (start/end = -1). Native Temporal_Anomaly_Annotation.txt is eval-only —
+# see heads.anomaly.ucf_temporal / eval_localization.
 
 
 def build_train_label_maps(

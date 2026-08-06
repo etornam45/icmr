@@ -1,8 +1,9 @@
 import argparse
 import os
+from pathlib import Path
 
 import torch
-import torch.optim as optim
+from torch import optim
 from tqdm import tqdm
 
 from dinov3.checkpoints.load import load_checkpoint
@@ -22,10 +23,18 @@ DEFAULT_OUT_PATH = "dinov3/checkpoints/model/detr_decoder.pt"
 def parse_args():
     parser = argparse.ArgumentParser(description="Train DINOv3 + DETR decoder")
     parser.add_argument(
-        "--img-dir", type=str, default="coco/images/val2017"
+        "--img-dir", type=str, default="coco/images/train2017"
     )
     parser.add_argument(
         "--ann-file",
+        type=str,
+        default="coco/annotations/instances_train2017.json",
+    )
+    parser.add_argument(
+        "--val-img-dir", type=str, default="coco/images/val2017"
+    )
+    parser.add_argument(
+        "--val-ann-file",
         type=str,
         default="coco/annotations/instances_val2017.json",
     )
@@ -56,19 +65,51 @@ def train_step(model: DETR, img_embed, target, lf: HungarianLoss):
     return loss, stats
 
 
+@torch.no_grad()
+def evaluate(model: DETR, backbone, loader, lf: HungarianLoss, device, num_batches: int):
+    model.eval()
+    total_loss = 0.0
+    prog_bar = tqdm(
+        loader, desc="Validating", unit="batch", total=num_batches, leave=False
+    )
+    for batch in prog_bar:
+        image = batch["image"].to(device)
+        target = {
+            "boxes": batch["boxes"].to(device),
+            "labels": batch["labels"].to(device),
+        }
+
+        features = backbone(image, masks=None, is_training=True)
+        patches = features["x_norm_patchtokens"]
+        loss, _ = train_step(model, patches, target, lf)
+
+        prog_bar.set_postfix(loss=f"{loss.item():.4f}")
+        total_loss += loss.item()
+    prog_bar.close()
+    return total_loss / max(num_batches, 1)
+
+
 def main():
     args = parse_args()
     device = get_device()
     print(f"Using device: {device}")
 
-    loader, num_batches = make_dataloader(
+    train_loader, num_train_batches = make_dataloader(
         args.img_dir,
         args.ann_file,
         img_size=args.img_size,
         batch_size=args.batch_size,
         shuffle=True,
     )
-    print("Total batches per epoch:", num_batches)
+    val_loader, num_val_batches = make_dataloader(
+        args.val_img_dir,
+        args.val_ann_file,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+    print("Train batches per epoch:", num_train_batches)
+    print("Val batches:", num_val_batches)
 
     dinov3_small = vit_small(
         patch_size=16,
@@ -93,6 +134,7 @@ def main():
     ).to(device)
 
     out_path = args.output
+    best_path = str(Path(out_path).with_name(f"{Path(out_path).stem}_best.pt"))
     if os.path.exists(out_path):
         state_dict = torch.load(out_path)
         detr_decoder.load_state_dict(state_dict)
@@ -117,11 +159,14 @@ def main():
         )
         print(f"Logging run {logger.run_id} to {args.log_db}")
 
+    best_val_loss = float("inf")
+
     try:
         for epoch in range(args.epochs):
+            detr_decoder.train()
             total_loss = 0.0
             prog_bar = tqdm(
-                loader, desc="Training", unit="batch", total=num_batches
+                train_loader, desc="Training", unit="batch", total=num_train_batches
             )
             for batch in prog_bar:
                 image = batch["image"].to(device)
@@ -143,19 +188,41 @@ def main():
                 total_loss += loss.item()
             prog_bar.close()
 
-            epoch_loss = total_loss / num_batches
-            print(f"Epoch {epoch}, Loss: {epoch_loss}")
+            train_loss = total_loss / max(num_train_batches, 1)
+            val_loss = evaluate(
+                detr_decoder,
+                dinov3_small,
+                val_loader,
+                lf,
+                device,
+                num_val_batches,
+            )
+
+            print(
+                f"Epoch {epoch + 1}/{args.epochs}: "
+                f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
+            )
             if logger is not None:
-                logger.log_metric(
-                    "train/loss",
-                    epoch_loss,
+                logger.log_metrics(
+                    {
+                        "train/loss": train_loss,
+                        "val/loss": val_loss,
+                    },
                     epoch=epoch + 1,
-                    split="train",
                 )
+
             torch.save(detr_decoder.state_dict(), out_path)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(detr_decoder.state_dict(), best_path)
+                print(f"  saved best checkpoint (val_loss={best_val_loss:.4f})")
 
         if logger is not None:
             logger.finish(status="completed")
+        print(
+            f"Training complete. Best val_loss={best_val_loss:.4f}. "
+            f"Latest: {out_path}, best: {best_path}"
+        )
     except Exception:
         if logger is not None:
             logger.finish(status="failed")

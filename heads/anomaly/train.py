@@ -1,4 +1,4 @@
-"""Train DINOv3 anomaly classifier on VAU-Bench Anomaly Class."""
+"""Train DINOv3 WTAL anomaly localizer on VAU-Bench UCF video-level labels."""
 
 from __future__ import annotations
 
@@ -7,17 +7,18 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from torch import nn, optim
+from torch import optim
 from tqdm import tqdm
 
 from dinov3.utils.device import get_device
 from heads.anomaly.dataset import build_train_label_maps
+from heads.anomaly.losses import mil_ranking_loss, topk_mil_loss
 from heads.anomaly.model import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_NUM_FRAMES,
     build_anomaly_model,
-    classifier_trainable_params,
     load_anomaly_checkpoint,
+    localizer_trainable_params,
     save_anomaly_checkpoint,
 )
 from heads.vqa.vau_dataset import DEFAULT_CACHE_DIR, make_vau_class_dataloader
@@ -26,30 +27,16 @@ from logger import SQLiteLogger
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train DINOv3 video anomaly classifier on VAU-Bench"
+        description="Train DINOv3 WTAL anomaly localizer on VAU-Bench (UCF)"
     )
-    parser.add_argument(
-        "--video-root",
-        type=str,
-        default=None,
-        help="Directory of VAU-Bench videos (default: <cache-dir>/videos)",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default=DEFAULT_CACHE_DIR,
-        help="Local cache for VAU-Bench annotations",
-    )
-    parser.add_argument(
-        "--skip-missing-videos",
-        action="store_true",
-        help="Train/evaluate only rows whose videos exist under video-root",
-    )
+    parser.add_argument("--video-root", type=str, default=None)
+    parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--skip-missing-videos", action="store_true")
     parser.add_argument(
         "--sources",
         type=str,
         default="ucf",
-        help="Comma-separated source filter (default: ucf). Use empty string for all.",
+        help="Comma-separated source filter (default: ucf). Empty = all.",
     )
     parser.add_argument(
         "--eval-split",
@@ -65,25 +52,32 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=str, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument(
-        "--log-db",
-        type=str,
-        default=None,
-        help="SQLite database path for training/eval metrics (optional)",
-    )
-    parser.add_argument(
-        "--run-name",
-        type=str,
-        default=None,
-        help="Optional name for the logged training run",
-    )
+    parser.add_argument("--lambda-topk", type=float, default=1.0)
+    parser.add_argument("--lambda-mil", type=float, default=1.0)
+    parser.add_argument("--lambda-svdd", type=float, default=0.1)
+    parser.add_argument("--log-db", type=str, default=None)
+    parser.add_argument("--run-name", type=str, default=None)
     return parser.parse_args()
 
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def _normal_index(label2id: dict[str, int]) -> int:
+    for key in ("Normal", "normal", "Normal_Videos"):
+        if key in label2id:
+            return label2id[key]
+    # Fallback: last resort — prefer any label containing 'normal'
+    for name, idx in label2id.items():
+        if "normal" in name.lower():
+            return idx
+    raise KeyError(f"No Normal class in label2id: {sorted(label2id)}")
+
+
+def train_epoch(model, loader, optimizer, device, args, normal_index: int):
     model.train()
     model.vision_model.eval()
     total_loss = 0.0
+    total_topk = 0.0
+    total_mil = 0.0
+    total_svdd = 0.0
     correct = 0
     total = 0
 
@@ -91,46 +85,78 @@ def train_epoch(model, loader, optimizer, criterion, device):
     for batch in pbar:
         videos = batch["video"].to(device)
         labels = batch["label"].to(device)
+        is_anomaly = labels != normal_index
 
         optimizer.zero_grad()
-        logits = model(videos)
-        loss = criterion(logits, labels)
+        out = model(videos)
+        cas = out["cas_logits"]
+        actionness = out["actionness"]
+        embeddings = out["embeddings"]
+
+        loss_topk = topk_mil_loss(cas, labels)
+        loss_mil = mil_ranking_loss(actionness, is_anomaly)
+        # SVDD on confirmed-normal embeddings only
+        if (~is_anomaly).any():
+            normal_emb = embeddings[~is_anomaly]
+            model.svdd.update_center(normal_emb)
+            loss_svdd = model.svdd.loss(normal_emb)
+        else:
+            loss_svdd = cas.new_zeros(())
+
+        loss = (
+            args.lambda_topk * loss_topk
+            + args.lambda_mil * loss_mil
+            + args.lambda_svdd * loss_svdd
+        )
         if not torch.isfinite(loss):
             print("Warning: non-finite loss, skipping batch")
             continue
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(classifier_trainable_params(model), 1.0)
+        torch.nn.utils.clip_grad_norm_(localizer_trainable_params(model), 1.0)
         optimizer.step()
 
-        total_loss += loss.item() * labels.size(0)
-        preds = logits.argmax(dim=-1)
+        n = labels.size(0)
+        total_loss += loss.item() * n
+        total_topk += float(loss_topk.item()) * n
+        total_mil += float(loss_mil.item()) * n
+        total_svdd += float(loss_svdd.item()) * n
+
+        video_logits = model.video_logits(cas)
+        preds = video_logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
-        total += labels.size(0)
+        total += n
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
             acc=f"{correct / max(total, 1):.3f}",
         )
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    return {
+        "loss": total_loss / max(total, 1),
+        "topk": total_topk / max(total, 1),
+        "mil": total_mil / max(total, 1),
+        "svdd": total_svdd / max(total, 1),
+        "accuracy": correct / max(total, 1),
+    }
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, device, normal_index: int):
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
-    # confusion counts: label -> pred -> count
     confusion: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
     for batch in tqdm(loader, desc="Evaluating", leave=False):
         videos = batch["video"].to(device)
         labels = batch["label"].to(device)
-        logits = model(videos)
-        loss = criterion(logits, labels)
+        out = model(videos)
+        cas = out["cas_logits"]
+        loss = topk_mil_loss(cas, labels)
+        video_logits = model.video_logits(cas)
 
         total_loss += loss.item() * labels.size(0)
-        preds = logits.argmax(dim=-1)
+        preds = video_logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
         for pred, label in zip(preds.tolist(), labels.tolist()):
@@ -157,23 +183,26 @@ def evaluate(model, loader, criterion, device):
         "macro_recall": sum(recalls) / max(len(recalls), 1),
         "macro_f1": sum(f1s) / max(len(f1s), 1),
         "num_samples": total,
+        "normal_index": normal_index,
     }
 
 
 def main():
     args = parse_args()
-    # Empty string disables the default UCF-only filter.
     sources = args.sources if args.sources else None
     device = get_device()
     print(f"Using device: {device}")
 
     label2id, _id2label = build_train_label_maps(args.cache_dir, sources=sources)
+    normal_index = _normal_index(label2id)
     print(f"Anomaly classes ({len(label2id)}): {sorted(label2id)}")
+    print(f"Normal index: {normal_index}")
 
     model = build_anomaly_model(
         device,
         num_classes=len(label2id),
         hidden_dim=args.hidden_dim,
+        normal_index=normal_index,
     )
 
     if args.resume:
@@ -193,9 +222,8 @@ def main():
     )
     print(f"Train batches: {len(train_loader)}")
 
-    criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(
-        classifier_trainable_params(model),
+        localizer_trainable_params(model),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -217,8 +245,8 @@ def main():
 
     try:
         for epoch in range(args.epochs):
-            train_loss, train_acc = train_epoch(
-                model, train_loader, optimizer, criterion, device
+            train_metrics = train_epoch(
+                model, train_loader, optimizer, device, args, normal_index
             )
 
             eval_loader, _ = make_vau_class_dataloader(
@@ -233,12 +261,16 @@ def main():
                 skip_missing=args.skip_missing_videos,
                 sources=sources,
             )
-            metrics = evaluate(model, eval_loader, criterion, device)
+            metrics = evaluate(model, eval_loader, device, normal_index)
             del eval_loader
 
             print(
                 f"Epoch {epoch + 1}/{args.epochs}: "
-                f"train_loss={train_loss:.4f}, train_acc={train_acc:.3f}, "
+                f"train_loss={train_metrics['loss']:.4f} "
+                f"(topk={train_metrics['topk']:.4f}, "
+                f"mil={train_metrics['mil']:.4f}, "
+                f"svdd={train_metrics['svdd']:.4f}), "
+                f"train_acc={train_metrics['accuracy']:.3f}, "
                 f"eval_loss={metrics['loss']:.4f}, "
                 f"eval_acc={metrics['accuracy']:.3f}, "
                 f"macro_f1={metrics['macro_f1']:.3f}"
@@ -247,8 +279,11 @@ def main():
             if logger is not None:
                 logger.log_metrics(
                     {
-                        "train/loss": train_loss,
-                        "train/accuracy": train_acc,
+                        "train/loss": train_metrics["loss"],
+                        "train/topk": train_metrics["topk"],
+                        "train/mil": train_metrics["mil"],
+                        "train/svdd": train_metrics["svdd"],
+                        "train/accuracy": train_metrics["accuracy"],
                         "eval/loss": metrics["loss"],
                         "eval/accuracy": metrics["accuracy"],
                         "eval/macro_f1": metrics["macro_f1"],

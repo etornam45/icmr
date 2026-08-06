@@ -21,6 +21,19 @@ from server.runtime import ModelRuntime
 logger = logging.getLogger(__name__)
 
 
+def build_caption_prompt(
+    anomaly_class: str,
+    score: float,
+    class_hint: bool,
+) -> str:
+    if not class_hint:
+        return CAPTION_PROMPT
+    return (
+        f"Predicted category: {anomaly_class} (confidence {score:.2f}).\n"
+        f"{CAPTION_PROMPT}"
+    )
+
+
 class MonitorService:
     def __init__(
         self,
@@ -47,6 +60,7 @@ class MonitorService:
             "source": None,
             "running": False,
             "is_anomaly": False,
+            "segments": [],
         }
         self._lock = asyncio.Lock()
 
@@ -61,11 +75,9 @@ class MonitorService:
         if not uri:
             raise ValueError("uri is required")
 
-        # Allow clients to send type=rtsp for any network URL; refine from URI.
         if source_type == "rtsp":
             source_type = classify_uri(uri)
             if source_type == "file":
-                # Explicit network mode with a non-URL path is still rejected.
                 raise ValueError("Stream URL must start with rtsp://, http://, or https://")
         elif source_type == "stream":
             source_type = classify_uri(uri)
@@ -141,12 +153,15 @@ class MonitorService:
                     await asyncio.sleep(0.05)
                     continue
 
+                span = self.buffer.time_span()
+                window_start_ts = span[0] if span else None
+                window_end_ts = span[1] if span else None
+
                 frames = self.buffer.sample_uniform(self.cfg.num_frames)
                 if len(frames) < max(1, self.cfg.num_frames // 4):
                     await asyncio.sleep(0.05)
                     continue
 
-                # Pad by repeating last frame if buffer still warming up.
                 while len(frames) < self.cfg.num_frames:
                     frames.append(frames[-1])
 
@@ -158,6 +173,8 @@ class MonitorService:
                         frames,
                         preview,
                         self.cfg,
+                        window_start_ts,
+                        window_end_ts,
                     )
                 except Exception:
                     logger.exception("Pipeline tick failed")
@@ -175,6 +192,9 @@ class MonitorService:
                     "score": result.anomaly_score,
                     "top_k": result.top_k,
                     "detections": result.detections,
+                    "segments": result.segments,
+                    "segment": result.segment,
+                    "svdd_score": result.svdd_score,
                     "source": {"type": source.type, "uri": source.uri},
                     "running": True,
                     "is_anomaly": result.is_anomaly,
@@ -190,6 +210,10 @@ class MonitorService:
                         anomaly_class=result.anomaly_class or "unknown",
                         score=float(result.anomaly_score or 0.0),
                         videos_tensor=result.videos_tensor,
+                        segment=result.segment,
+                        svdd_score=result.svdd_score,
+                        window_start_ts=result.window_start_ts,
+                        window_end_ts=result.window_end_ts,
                     )
 
                 await asyncio.sleep(self.cfg.inference_interval_sec)
@@ -203,6 +227,10 @@ class MonitorService:
         anomaly_class: str,
         score: float,
         videos_tensor,
+        segment: dict[str, Any] | None = None,
+        svdd_score: float | None = None,
+        window_start_ts: float | None = None,
+        window_end_ts: float | None = None,
     ) -> None:
         now = time.time()
         if now - self._last_anomaly_ts < self.cfg.anomaly_cooldown_sec:
@@ -211,11 +239,29 @@ class MonitorService:
             return
 
         self._last_anomaly_ts = now
+
+        # Map relative segment times onto absolute buffer timestamps.
+        event_start = None
+        event_end = None
+        if (
+            segment is not None
+            and window_start_ts is not None
+            and window_end_ts is not None
+        ):
+            event_start = window_start_ts + float(segment["start"])
+            event_end = window_start_ts + float(segment["end"])
+            pad = self.cfg.span_pad_sec
+            event_start = max(window_start_ts, event_start - pad)
+            event_end = min(window_end_ts, event_end + pad)
+
         event = self.events.add_event(
             source=source_uri,
             anomaly_class=anomaly_class,
             score=score,
             caption=None if self.runtime.has_vqa else "(VQA unavailable)",
+            start_ts=event_start,
+            end_ts=event_end,
+            svdd_score=svdd_score,
         )
         await self._broadcast(
             {
@@ -229,8 +275,13 @@ class MonitorService:
 
         self._vqa_busy = True
         n_vqa = max(self.runtime.vqa_num_frames, self.cfg.num_frames)
-        # Prefer a denser window matching the VQA checkpoint frame count.
-        vqa_frames = self.buffer.sample_uniform(n_vqa)
+
+        vqa_frames: list = []
+        if event_start is not None and event_end is not None:
+            vqa_frames = self.buffer.sample_time_range(event_start, event_end, n_vqa)
+        if not vqa_frames:
+            vqa_frames = self.buffer.sample_uniform(n_vqa)
+
         if not vqa_frames and videos_tensor is not None:
             clip = videos_tensor
         elif vqa_frames:
@@ -245,6 +296,10 @@ class MonitorService:
             self._vqa_busy = False
             return
 
+        prompt = build_caption_prompt(
+            anomaly_class, score, self.cfg.vqa_class_hint
+        )
+
         async def _run_caption() -> None:
             try:
                 caption = await asyncio.to_thread(
@@ -252,7 +307,7 @@ class MonitorService:
                     self.runtime.vqa,
                     self.runtime.vqa_tokenizer,
                     clip.to(self.runtime.device),
-                    CAPTION_PROMPT,
+                    prompt,
                 )
                 self.events.update_caption(event.id, caption)
                 updated = event.to_dict()

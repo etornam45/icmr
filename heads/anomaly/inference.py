@@ -1,4 +1,4 @@
-"""Anomaly class inference for a single video."""
+"""Anomaly localization inference for a single video."""
 
 from __future__ import annotations
 
@@ -7,13 +7,15 @@ from pathlib import Path
 import torch
 
 from dinov3.utils.device import get_device
+from heads.anomaly.decode import Segment
 from heads.anomaly.model import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_NUM_FRAMES,
     IMG_SIZE,
-    DINOv3AnomalyClassifier,
+    DINOv3AnomalyLocalizer,
     build_anomaly_model,
     load_anomaly_checkpoint,
+    localize_from_cls,
 )
 from heads.vqa.dataset import load_video_frames
 from heads.vqa.vau_dataset import load_label_maps
@@ -42,13 +44,26 @@ def load_anomaly_label_maps(checkpoint_path: Path) -> tuple[dict[str, int], dict
     )
 
 
+def _segments_to_dicts(segments: list[Segment]) -> list[dict]:
+    return [
+        {
+            "start": s.start,
+            "end": s.end,
+            "class": s.class_name,
+            "class_id": s.class_id,
+            "confidence": s.confidence,
+        }
+        for s in segments
+    ]
+
+
 @torch.no_grad()
 def predict_from_logits(
     logits: torch.Tensor,
     id2label: dict[int, str],
     top_k: int = 5,
 ) -> dict:
-    """Convert classifier logits [B, C] or [C] into prediction + ranking."""
+    """Convert video-level logits [B, C] or [C] into prediction + ranking."""
     if logits.dim() == 2:
         logits = logits[0]
     probs = torch.softmax(logits, dim=-1)
@@ -58,41 +73,81 @@ def predict_from_logits(
         {"class": id2label[int(index)], "probability": float(value)}
         for value, index in zip(values.tolist(), indices.tolist())
     ]
-    return {"prediction": ranking[0]["class"], "top_k": ranking, "score": ranking[0]["probability"]}
+    return {
+        "prediction": ranking[0]["class"],
+        "top_k": ranking,
+        "score": ranking[0]["probability"],
+    }
 
 
 @torch.no_grad()
 def predict_from_cls(
-    model: DINOv3AnomalyClassifier,
+    model: DINOv3AnomalyLocalizer,
     cls_tokens: torch.Tensor,
     id2label: dict[int, str],
     top_k: int = 5,
+    window_duration: float = 8.0,
+    nms_sigma: float = 0.5,
+    nms_floor: float = 0.05,
+    deploy_threshold: float = 0.0,
 ) -> dict:
-    """
-    Classify from precomputed CLS tokens (shared-backbone path).
-
-    Args:
-        cls_tokens: [B, T, D] or [T, D]
-    """
-    if cls_tokens.dim() == 2:
-        cls_tokens = cls_tokens.unsqueeze(0)
-    pooled = cls_tokens.mean(dim=1)
-    logits = model.head(model.norm(pooled))
-    return predict_from_logits(logits, id2label, top_k=top_k)
+    """Classify + localize from precomputed CLS tokens (shared-backbone path)."""
+    result = localize_from_cls(
+        model,
+        cls_tokens,
+        id2label,
+        window_duration=window_duration,
+        nms_sigma=nms_sigma,
+        nms_floor=nms_floor,
+        deploy_threshold=deploy_threshold,
+    )
+    ranking = {
+        "prediction": result["prediction"],
+        "score": result["score"],
+        "top_k": result["top_k"][:top_k],
+    }
+    result["prediction"] = ranking["prediction"]
+    result["score"] = ranking["score"]
+    result["top_k"] = ranking["top_k"]
+    result["segments"] = _segments_to_dicts(result["segments"])
+    if hasattr(result.get("actionness"), "numpy"):
+        result["actionness"] = result["actionness"].numpy()
+    # Prefer top segment confidence as anomaly score when available
+    if result["segments"]:
+        top_seg = result["segments"][0]
+        result["segment"] = top_seg
+        if top_seg["class"].lower() not in {"normal", "normal_videos"}:
+            result["prediction"] = top_seg["class"]
+            result["score"] = top_seg["confidence"]
+    else:
+        result["segment"] = None
+    return result
 
 
 @torch.no_grad()
 def predict_from_videos(
-    model: DINOv3AnomalyClassifier,
+    model: DINOv3AnomalyLocalizer,
     videos: torch.Tensor,
     id2label: dict[int, str],
     top_k: int = 5,
+    window_duration: float | None = None,
+    **decode_kwargs,
 ) -> dict:
-    """Classify a video tensor [B, T, 3, H, W] or [T, 3, H, W]."""
+    """Localize a video tensor [B, T, 3, H, W] or [T, 3, H, W]."""
     if videos.dim() == 4:
         videos = videos.unsqueeze(0)
-    logits = model(videos)
-    return predict_from_logits(logits, id2label, top_k=top_k)
+    cls = model.encode_cls(videos)
+    if window_duration is None:
+        # Unknown duration — treat timesteps as unit-spaced seconds.
+        window_duration = float(max(cls.shape[1] - 1, 1))
+    return predict_from_cls(
+        model,
+        cls,
+        id2label,
+        top_k=top_k,
+        window_duration=window_duration,
+        **decode_kwargs,
+    )
 
 
 def run_inference(
@@ -102,8 +157,9 @@ def run_inference(
     start_sec: float | None = None,
     end_sec: float | None = None,
     top_k: int = 5,
-    model: DINOv3AnomalyClassifier | None = None,
+    model: DINOv3AnomalyLocalizer | None = None,
     id2label: dict[int, str] | None = None,
+    deploy_threshold: float = 0.0,
 ) -> dict:
     device = get_device()
 
@@ -115,7 +171,10 @@ def run_inference(
                 "Run python -m heads.anomaly.train first."
             )
         label2id, id2label = load_anomaly_label_maps(checkpoint_path)
-        model = build_anomaly_model(device, num_classes=len(label2id))
+        normal_index = label2id.get("Normal", label2id.get("normal", 0))
+        model = build_anomaly_model(
+            device, num_classes=len(label2id), normal_index=normal_index
+        )
         load_anomaly_checkpoint(model, checkpoint_path, device)
         model.eval()
 
@@ -127,23 +186,43 @@ def run_inference(
         end_sec=end_sec,
     ).unsqueeze(0).to(device)
 
-    result = predict_from_videos(model, frames, id2label, top_k=top_k)
-    print(f"Predicted anomaly class: {result['prediction']}")
+    if start_sec is not None and end_sec is not None and end_sec > start_sec:
+        window_duration = float(end_sec - start_sec)
+    else:
+        window_duration = float(max(num_frames - 1, 1))
+
+    result = predict_from_videos(
+        model,
+        frames,
+        id2label,
+        top_k=top_k,
+        window_duration=window_duration,
+        deploy_threshold=deploy_threshold,
+    )
+    print(f"Predicted anomaly class: {result['prediction']} ({result['score']:.4f})")
     for item in result["top_k"]:
         print(f"  {item['class']}: {item['probability']:.4f}")
+    if result.get("segments"):
+        print("Segments:")
+        for seg in result["segments"][:10]:
+            print(
+                f"  [{seg['start']:.2f}, {seg['end']:.2f}] "
+                f"{seg['class']} conf={seg['confidence']:.3f}"
+            )
     return result
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="VAU-Bench anomaly class inference")
+    parser = argparse.ArgumentParser(description="WTAL anomaly localization inference")
     parser.add_argument("--video", type=str, required=True, help="Path to video")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument("--start-sec", type=float, default=None)
     parser.add_argument("--end-sec", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--deploy-threshold", type=float, default=0.0)
     args = parser.parse_args()
 
     checkpoint = Path(args.checkpoint)
@@ -161,4 +240,5 @@ if __name__ == "__main__":
             start_sec=args.start_sec,
             end_sec=args.end_sec,
             top_k=args.top_k,
+            deploy_threshold=args.deploy_threshold,
         )

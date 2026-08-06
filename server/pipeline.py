@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
@@ -28,6 +28,11 @@ class PipelineResult:
     is_anomaly: bool
     videos_tensor: torch.Tensor | None
     preview_bgr: np.ndarray
+    segments: list[dict[str, Any]] = field(default_factory=list)
+    segment: dict[str, Any] | None = None
+    svdd_score: float | None = None
+    window_start_ts: float | None = None
+    window_end_ts: float | None = None
 
 
 def bgr_frames_to_tensor(
@@ -50,12 +55,20 @@ def is_anomaly_event(
     prediction: str | None,
     score: float | None,
     cfg: ServerConfig,
+    segments: list[dict[str, Any]] | None = None,
 ) -> bool:
+    if segments:
+        return any(
+            s.get("class") not in cfg.normal_labels
+            and str(s.get("class", "")).lower()
+            not in {n.lower() for n in cfg.normal_labels}
+            and float(s.get("confidence", 0.0)) >= cfg.deploy_threshold
+            for s in segments
+        )
     if prediction is None or score is None:
         return False
     if prediction in cfg.normal_labels:
         return False
-    # Case-insensitive normal check
     if prediction.lower() in {n.lower() for n in cfg.normal_labels}:
         return False
     return score >= cfg.anomaly_threshold
@@ -67,6 +80,8 @@ def run_pipeline(
     frames_bgr: list[np.ndarray],
     preview_bgr: np.ndarray,
     cfg: ServerConfig,
+    window_start_ts: float | None = None,
+    window_end_ts: float | None = None,
 ) -> PipelineResult:
     if not frames_bgr:
         raise ValueError("No frames for inference")
@@ -83,16 +98,32 @@ def run_pipeline(
     anomaly_class: str | None = None
     anomaly_score: float | None = None
     top_k: list[dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
+    segment: dict[str, Any] | None = None
+    svdd_score: float | None = None
+
+    if window_start_ts is not None and window_end_ts is not None:
+        window_duration = max(window_end_ts - window_start_ts, 1e-3)
+    else:
+        window_duration = float(cfg.buffer_seconds)
+
     if runtime.has_anomaly:
         result = predict_from_cls(
             runtime.anomaly,
             features["cls_tokens"],
             runtime.anomaly_id2label,
             top_k=5,
+            window_duration=window_duration,
+            nms_sigma=cfg.nms_sigma,
+            deploy_threshold=0.0,  # gate in is_anomaly_event
         )
         anomaly_class = result["prediction"]
         anomaly_score = float(result["score"])
         top_k = result["top_k"]
+        segments = list(result.get("segments") or [])
+        segment = result.get("segment")
+        if result.get("svdd_distance") is not None:
+            svdd_score = float(result["svdd_distance"])
 
     jpegs = render_all_previews(
         preview_bgr,
@@ -109,7 +140,14 @@ def run_pipeline(
         anomaly_score=anomaly_score,
         top_k=top_k,
         detections=detections,
-        is_anomaly=is_anomaly_event(anomaly_class, anomaly_score, cfg),
+        is_anomaly=is_anomaly_event(
+            anomaly_class, anomaly_score, cfg, segments=segments
+        ),
         videos_tensor=videos.detach().cpu(),
         preview_bgr=preview_bgr,
+        segments=segments,
+        segment=segment,
+        svdd_score=svdd_score,
+        window_start_ts=window_start_ts,
+        window_end_ts=window_end_ts,
     )

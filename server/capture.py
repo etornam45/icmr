@@ -231,6 +231,29 @@ class FrameBuffer:
         indices = np.linspace(0, len(frames) - 1, n)
         return [frames[int(i)][1].copy() for i in indices]
 
+    def time_span(self) -> tuple[float, float] | None:
+        """Oldest and newest timestamps currently in the buffer."""
+        with self._lock:
+            if not self._frames:
+                return None
+            return self._frames[0][0], self._frames[-1][0]
+
+    def sample_time_range(
+        self,
+        start_ts: float,
+        end_ts: float,
+        n: int,
+    ) -> list[np.ndarray]:
+        """Uniformly sample ``n`` frames whose timestamps fall in [start, end]."""
+        with self._lock:
+            frames = [(ts, frame) for ts, frame in self._frames if start_ts <= ts <= end_ts]
+        if not frames:
+            return []
+        if len(frames) <= n:
+            return [f.copy() for _, f in frames]
+        indices = np.linspace(0, len(frames) - 1, n)
+        return [frames[int(i)][1].copy() for i in indices]
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._frames)

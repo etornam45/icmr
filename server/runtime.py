@@ -18,7 +18,7 @@ from heads.anomaly.inference import (
     resolve_anomaly_checkpoint,
 )
 from heads.anomaly.model import (
-    DINOv3AnomalyClassifier,
+    DINOv3AnomalyLocalizer,
     build_anomaly_model,
     load_anomaly_checkpoint,
 )
@@ -39,7 +39,7 @@ class ModelRuntime:
     device: torch.device
     backbone: nn.Module
     detr: nn.Module
-    anomaly: DINOv3AnomalyClassifier | None = None
+    anomaly: DINOv3AnomalyLocalizer | None = None
     anomaly_id2label: dict[int, str] = field(default_factory=dict)
     vqa: DINOv3QwenXAttn | None = None
     vqa_tokenizer: Any = None
@@ -126,21 +126,30 @@ def load_runtime(cfg: ServerConfig) -> ModelRuntime:
     logger.info("Loading DETR decoder from %s", cfg.detr_checkpoint)
     detr = _load_detr(cfg.detr_checkpoint, device)
 
-    anomaly: DINOv3AnomalyClassifier | None = None
+    anomaly: DINOv3AnomalyLocalizer | None = None
     id2label: dict[int, str] = {}
     anomaly_path = resolve_anomaly_checkpoint(cfg.anomaly_checkpoint)
     if anomaly_path.exists():
         try:
             label2id, id2label = load_anomaly_label_maps(anomaly_path)
+            normal_index = next(
+                (
+                    label2id[k]
+                    for k in ("Normal", "normal", "Normal_Videos")
+                    if k in label2id
+                ),
+                0,
+            )
             anomaly = build_anomaly_model(
                 device,
                 num_classes=len(label2id),
                 vision_model=backbone,
+                normal_index=normal_index,
             )
             load_anomaly_checkpoint(anomaly, anomaly_path, device)
             anomaly.eval()
             logger.info(
-                "Anomaly head loaded (%d classes) from %s",
+                "Anomaly WTAL head loaded (%d classes) from %s",
                 len(label2id),
                 anomaly_path,
             )

@@ -19,6 +19,9 @@ class EventRecord:
     score: float
     caption: str | None
     thumbnail_path: str | None = None
+    start_ts: float | None = None
+    end_ts: float | None = None
+    svdd_score: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -30,6 +33,9 @@ class EventRecord:
             "score": self.score,
             "caption": self.caption,
             "thumbnail_path": self.thumbnail_path,
+            "start_ts": self.start_ts,
+            "end_ts": self.end_ts,
+            "svdd_score": self.svdd_score,
         }
 
 
@@ -46,6 +52,18 @@ class EventStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        for col, decl in (
+            ("start_ts", "REAL"),
+            ("end_ts", "REAL"),
+            ("svdd_score", "REAL"),
+        ):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+
     def _init_db(self) -> None:
         with self._lock:
             conn = self._connect()
@@ -59,10 +77,14 @@ class EventStore:
                         anomaly_class TEXT NOT NULL,
                         score REAL NOT NULL,
                         caption TEXT,
-                        thumbnail_path TEXT
+                        thumbnail_path TEXT,
+                        start_ts REAL,
+                        end_ts REAL,
+                        svdd_score REAL
                     )
                     """
                 )
+                self._ensure_columns(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -75,6 +97,9 @@ class EventStore:
         caption: str | None = None,
         thumbnail_path: str | None = None,
         timestamp: float | None = None,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        svdd_score: float | None = None,
     ) -> EventRecord:
         ts = time.time() if timestamp is None else timestamp
         with self._lock:
@@ -83,13 +108,23 @@ class EventStore:
                 cur = conn.execute(
                     """
                     INSERT INTO events
-                        (timestamp, source, anomaly_class, score, caption, thumbnail_path)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (timestamp, source, anomaly_class, score, caption,
+                         thumbnail_path, start_ts, end_ts, svdd_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (ts, source, anomaly_class, float(score), caption, thumbnail_path),
+                    (
+                        ts,
+                        source,
+                        anomaly_class,
+                        float(score),
+                        caption,
+                        thumbnail_path,
+                        start_ts,
+                        end_ts,
+                        svdd_score,
+                    ),
                 )
                 event_id = int(cur.lastrowid)
-                # Trim oldest beyond max_events
                 conn.execute(
                     """
                     DELETE FROM events WHERE id NOT IN (
@@ -109,6 +144,9 @@ class EventStore:
             score=float(score),
             caption=caption,
             thumbnail_path=thumbnail_path,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            svdd_score=svdd_score,
         )
 
     def update_caption(self, event_id: int, caption: str) -> None:
@@ -129,7 +167,8 @@ class EventStore:
             try:
                 rows = conn.execute(
                     """
-                    SELECT id, timestamp, source, anomaly_class, score, caption, thumbnail_path
+                    SELECT id, timestamp, source, anomaly_class, score, caption,
+                           thumbnail_path, start_ts, end_ts, svdd_score
                     FROM events
                     ORDER BY id DESC
                     LIMIT ?
@@ -147,6 +186,9 @@ class EventStore:
                 score=float(row["score"]),
                 caption=row["caption"],
                 thumbnail_path=row["thumbnail_path"],
+                start_ts=row["start_ts"],
+                end_ts=row["end_ts"],
+                svdd_score=row["svdd_score"],
             )
             for row in rows
         ]

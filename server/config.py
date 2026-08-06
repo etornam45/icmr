@@ -20,6 +20,13 @@ def _env_str(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw not in {"0", "false", "False", "no", "NO"}
+
+
 @dataclass
 class ServerConfig:
     backbone_weights: str = "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
@@ -35,8 +42,12 @@ class ServerConfig:
     preview_jpeg_quality: int = 75
 
     detection_threshold: float = 0.7
-    anomaly_threshold: float = 0.35
+    anomaly_threshold: float = 0.35  # legacy clip-level fallback
+    deploy_threshold: float = 0.15  # WTAL segment confidence gate
+    nms_sigma: float = 0.5
+    span_pad_sec: float = 1.0
     anomaly_cooldown_sec: float = 30.0
+    vqa_class_hint: bool = False
     normal_labels: set[str] = field(
         default_factory=lambda: {
             "Normal",
@@ -87,9 +98,15 @@ def load_config() -> ServerConfig:
     cfg.anomaly_threshold = _env_float(
         "ICMR_ANOMALY_THRESHOLD", cfg.anomaly_threshold
     )
+    cfg.deploy_threshold = _env_float(
+        "ICMR_DEPLOY_THRESHOLD", cfg.deploy_threshold
+    )
+    cfg.nms_sigma = _env_float("ICMR_NMS_SIGMA", cfg.nms_sigma)
+    cfg.span_pad_sec = _env_float("ICMR_SPAN_PAD", cfg.span_pad_sec)
     cfg.anomaly_cooldown_sec = _env_float(
         "ICMR_ANOMALY_COOLDOWN", cfg.anomaly_cooldown_sec
     )
+    cfg.vqa_class_hint = _env_bool("ICMR_VQA_CLASS_HINT", cfg.vqa_class_hint)
     cfg.events_db_path = _env_str("ICMR_EVENTS_DB", cfg.events_db_path)
     cfg.uploads_dir = _env_str("ICMR_UPLOADS_DIR", cfg.uploads_dir)
     cfg.max_upload_mb = _env_int("ICMR_MAX_UPLOAD_MB", cfg.max_upload_mb)

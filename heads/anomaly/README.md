@@ -1,53 +1,37 @@
-# DINOv3 VAU-Bench Anomaly Classifier
+# DINOv3 WTAL Anomaly Localizer
 
-Multi-class anomaly detection on
-[7xiang/VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench):
+Weakly-supervised temporal anomaly localization on
+[UCF-Crime](https://www.crcv.ucf.edu/projects/real-world/) via
+[VAU-Bench](https://huggingface.co/datasets/7xiang/VAU-Bench) video-level labels.
 
-- **Input**: video only (frames trimmed to `[Start Time, End Time]` when available)
-- **Output**: `Anomaly Class` label (~20 classes including Normal)
+Architecture (`ARCHITECTURE = temporal_wtal_v1`):
+
 - **Vision**: frozen DINOv3 ViT-S CLS token per sampled frame
-- **Head**: LayerNorm + MLP over temporal mean-pooled CLS features
+- **Temporal aggregator**: residual 1D conv stack over the frame sequence
+- **Feature pyramid**: strides `{1, 2, 4, 8}`
+- **Classification head**: shared MLP → class activation sequence (CAS)
+- **Boundary head**: stubbed in-code, **inactive** (no span-labeled train data)
+- **Train losses**: top-k MIL (video-level category) + binary MIL ranking + SVDD
+- **Inference**: multi-threshold proposals + OIC scoring + soft-NMS → segments
 
-Video-only Description captioning lives under [`heads/vqa`](../vqa) with
-`--dataset vau`.
+Native `Temporal_Anomaly_Annotation_for_Testing_Videos.txt` is **eval-only**
+(frame AUC / tIoU mAP). It never enters the training loss.
 
 ## Dataset setup
 
-Annotations come from Hugging Face. **UCF-Crime videos** come from
-[`etornam/ufc-crime-videos`](https://huggingface.co/datasets/etornam/ufc-crime-videos)
-(~57 GB with `--vau-only` for train+val; ~105 GB full) and are staged as
-`ucf_*` under `data/VAU-Bench/videos/`. Training defaults to **UCF-only**
-(`--sources ucf`).
+Same UCF staging as before — annotations from VAU-Bench, videos from
+[`etornam/ufc-crime-videos`](https://huggingface.co/datasets/etornam/ufc-crime-videos):
 
 ```bash
-# 1. Download annotations
 python -m heads.vqa.vau_dataset --annotations-only --split train
-
-# 2. Download only UCF videos named in VAU train+val (~57 GB) and stage as ucf_*
 python -m heads.vqa.vau_dataset --download-ucf --vau-only
-# Full mirror (~105 GB): omit --vau-only
-# python -m heads.vqa.vau_dataset --download-ucf --stage-only  # if already downloaded
-
-# 3. Verify UCF coverage
 python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split train
-python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split validation
 ```
 
-Train with `--skip-missing-videos` so incomplete downloads are skipped.
-
-Original UCF citation:
-[UCF-Crime project page](https://www.crcv.ucf.edu/projects/real-world/).
-
-When both `Start Time` and `End Time` are ≥ 0, the loader samples frames only
-inside that window. A value of `-1` means the temporal annotation is unavailable
-and the full video is used.
-
-See [`heads/vqa/README.md`](../vqa/README.md#vau-bench-description) for the
-shared layout diagram and download details.
+Training defaults to `--sources ucf`. VAU UCF train/val have **no** temporal
+spans; supervision is video-level category + normal/abnormal bags only.
 
 ## Train
-
-Defaults to UCF-only:
 
 ```bash
 python -m heads.anomaly.train \
@@ -58,46 +42,50 @@ python -m heads.anomaly.train \
   --num-frames 16
 ```
 
-Custom video root:
+Checkpoints land in `dinov3/checkpoints/model/anomaly_vau/` (and
+`anomaly_vau_best/`) as `classifier.pt` + `label2id.json`. Legacy mean-pool
+checkpoints are rejected — retrain is required.
 
-```bash
-python -m heads.anomaly.train \
-  --video-root /path/to/VAU-Bench/videos \
-  --sources ucf \
-  --skip-missing-videos \
-  --epochs 10
-```
-
-Checkpoints are written to `dinov3/checkpoints/model/anomaly_vau/` (and
-`anomaly_vau_best/`), including `classifier.pt` and `label2id.json`.
+Loss weights (CLI): `--lambda-topk 1.0 --lambda-mil 1.0 --lambda-svdd 0.1`.
 
 ## Inference
 
 ```bash
 python -m heads.anomaly.inference \
   --video data/VAU-Bench/videos/ucf_Abuse001_x264.mp4 \
-  --start-sec 23 \
-  --end-sec 31
+  --deploy-threshold 0.15
 ```
 
-```python
-from heads.anomaly.inference import run_inference
+Returns video-level class plus decoded segments `{start, end, class, confidence}`.
 
-result = run_inference(
-    video_path="data/VAU-Bench/videos/ucf_Abuse001_x264.mp4",
-    start_sec=23,
-    end_sec=31,
-)
-print(result["prediction"])
+## Server wiring
+
+Live path uses segment confidence ≥ `deploy_threshold` (`ICMR_DEPLOY_THRESHOLD`)
+to emit an `AnomalyEvent` with `start_ts` / `end_ts` / `svdd_score`, then samples
+the ring buffer in `[start - pad, end + pad]` for VQA. Optional class hint:
+
+```bash
+ICMR_VQA_CLASS_HINT=1
 ```
 
 ## Checks
 
 ```bash
 python -m py_compile \
-  heads/anomaly/dataset.py \
+  heads/anomaly/temporal.py \
+  heads/anomaly/pyramid.py \
+  heads/anomaly/heads.py \
+  heads/anomaly/losses.py \
+  heads/anomaly/decode.py \
+  heads/anomaly/ucf_temporal.py \
   heads/anomaly/model.py \
   heads/anomaly/train.py \
   heads/anomaly/inference.py \
-  heads/vqa/vau_dataset.py
+  server/pipeline.py \
+  server/monitor.py \
+  server/events.py \
+  server/config.py \
+  server/runtime.py
+
+python -m heads.anomaly.model
 ```
