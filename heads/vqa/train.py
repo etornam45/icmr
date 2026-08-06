@@ -1,4 +1,5 @@
 import argparse
+import gc
 from pathlib import Path
 
 import torch
@@ -8,6 +9,8 @@ from tqdm import tqdm
 from dinov3.utils.device import get_device
 from heads.vqa.dataset import (
     DEFAULT_CACHE_DIR as CUVA_CACHE_DIR,
+)
+from heads.vqa.dataset import (
     encode_user_prompt,
     make_dataloader,
 )
@@ -25,8 +28,10 @@ from heads.vqa.model import (
 )
 from heads.vqa.vau_dataset import (
     CAPTION_PROMPT,
-    DEFAULT_CACHE_DIR as VAU_CACHE_DIR,
     make_vau_caption_dataloader,
+)
+from heads.vqa.vau_dataset import (
+    DEFAULT_CACHE_DIR as VAU_CACHE_DIR,
 )
 from logger import SQLiteLogger
 
@@ -222,6 +227,13 @@ def _set_lora_requires_grad(model: DINOv3QwenXAttn, trainable: bool) -> int:
     return count
 
 
+def _release_cuda_memory() -> None:
+    """Drop Python refs and return fragmented CUDA blocks to the allocator."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def build_optimizer(
     model: DINOv3QwenXAttn,
     adapter_lr: float,
@@ -240,7 +252,9 @@ def build_optimizer(
         if not lora_params:
             raise RuntimeError("No trainable LoRA parameters found for joint stage")
         groups.append({"params": lora_params, "lr": llm_lr})
-    return optim.AdamW(groups, weight_decay=weight_decay)
+    # foreach=False avoids large temporary buffers that OOM on ~8GB GPUs
+    # after eval/generation fragments the CUDA allocator.
+    return optim.AdamW(groups, weight_decay=weight_decay, foreach=False)
 
 
 def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
@@ -256,11 +270,12 @@ def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         outputs = model(videos, input_ids, attention_mask, labels=labels)
         loss = outputs.loss
         if not torch.isfinite(loss):
             print("Warning: non-finite loss, skipping batch")
+            del outputs, videos, input_ids, attention_mask, labels
             continue
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -271,6 +286,7 @@ def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
         total_loss += loss.item()
         num_batches += 1
         pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / num_batches:.4f}")
+        del outputs, loss, videos, input_ids, attention_mask, labels
 
     return total_loss / max(num_batches, 1)
 
@@ -310,6 +326,7 @@ def evaluate(
 
         outputs = model(videos, input_ids, attention_mask, labels=labels)
         total_loss += outputs.loss.item()
+        del outputs
 
         if batch_idx in sample_batches:
             prompt = encode_user_prompt(tokenizer, [batch["question"][0]], device)
@@ -332,7 +349,11 @@ def evaluate(
             questions.append(batch["question"][0])
             clip = batch.get("clip_id", batch.get("sample_id", [""]))[0]
             clip_ids.append(clip)
+            del gen_ids, prompt
 
+        del videos, input_ids, attention_mask, labels
+
+    _release_cuda_memory()
     avg_loss = total_loss / max(len(loader), 1)
     return avg_loss, questions, references, hypotheses, clip_ids
 
@@ -371,6 +392,7 @@ def run_eval_epoch(
         max_gen_samples=args.eval_samples,
     )
     del eval_loader
+    _release_cuda_memory()
 
     print(f"{epoch_label}: eval_loss={eval_loss:.4f}")
     if refs:
@@ -401,6 +423,7 @@ def run_eval_epoch(
         best_loss = eval_loss
         save_hybrid_checkpoint(model, str(best_dir))
         print(f"  saved best checkpoint (eval_loss={eval_loss:.4f})")
+    _release_cuda_memory()
     return best_loss, improved
 
 
