@@ -129,6 +129,11 @@ select {
   overflow: hidden;
 }
 
+.inference-grid.has-expanded {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+
 .inference-pane {
   position: relative;
   display: flex;
@@ -137,6 +142,9 @@ select {
   min-height: 0;
   background: #050708;
   overflow: hidden;
+}
+.inference-pane.is-hidden {
+  display: none;
 }
 
 .inference-pane.alert::after {
@@ -149,6 +157,10 @@ select {
 }
 
 .pane-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
   flex-shrink: 0;
   z-index: 3;
   padding: 0.45rem 0.7rem;
@@ -166,6 +178,21 @@ select {
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+}
+
+.pane-expand {
+  display: grid;
+  place-items: center;
+  padding: 0.15rem;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 0;
+}
+
+.pane-expand:hover {
+  color: var(--text);
 }
 
 .live-frame {
@@ -495,5 +522,9 @@ select {
     grid-template-columns: 1fr;
     grid-template-rows: repeat(4, minmax(140px, 1fr));
     overflow: auto;
+  }
+  .inference-grid.has-expanded {
+    grid-template-rows: 1fr;
+    overflow: hidden;
   }
 }
