@@ -6,7 +6,11 @@ import torch
 from torch import optim
 from tqdm import tqdm
 
-from dinov3.checkpoints.load import load_checkpoint
+from dinov3.checkpoints.load import (
+    ensure_backbone_checkpoint,
+    load_checkpoint,
+    validate_checkpoint_file,
+)
 from dinov3.models import vit_small
 from dinov3.utils.device import get_device
 from heads.detr.dataset import make_dataloader
@@ -14,10 +18,12 @@ from heads.detr.matcher import HungarianLoss
 from heads.detr.transformer import DETR, build_detr
 from logger import SQLiteLogger
 
-BACKBONE_WEIGHTS = (
-    "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+BACKBONE_WEIGHTS = str(
+    _REPO_ROOT
+    / "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 )
-DEFAULT_OUT_PATH = "dinov3/checkpoints/model/detr_decoder.pt"
+DEFAULT_OUT_PATH = str(_REPO_ROOT / "dinov3/checkpoints/model/detr_decoder.pt")
 
 
 def parse_args():
@@ -37,6 +43,12 @@ def parse_args():
         "--val-ann-file",
         type=str,
         default="coco/annotations/instances_val2017.json",
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default=BACKBONE_WEIGHTS,
+        help="Path to DINOv3 ViT-S/16 weights (auto-downloads if missing)",
     )
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -117,7 +129,17 @@ def main():
         layerscale_init=1e-5,
         mask_k_bias=True,
     )
-    load_checkpoint(dinov3_small, BACKBONE_WEIGHTS)
+    backbone_weights = args.backbone
+    if Path(backbone_weights).exists() and not validate_checkpoint_file(
+        backbone_weights, expected_sha256=None
+    ):
+        print(
+            f"Warning: checkpoint at {backbone_weights} looks corrupt, "
+            "re-downloading"
+        )
+        Path(backbone_weights).unlink(missing_ok=True)
+    backbone_weights = ensure_backbone_checkpoint(backbone_weights)
+    load_checkpoint(dinov3_small, backbone_weights)
     dinov3_small.to(device)
     dinov3_small.eval()
     for p in dinov3_small.parameters():
