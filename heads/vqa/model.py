@@ -303,7 +303,12 @@ def vision_adapter_params(model: DINOv3QwenXAttn):
 
 
 def adapter_trainable_params(model: DINOv3QwenXAttn):
-    return [p for p in model.llm.parameters() if p.requires_grad]
+    """LoRA weights only (xattn lives under llm via wrappers — exclude it)."""
+    return [
+        param
+        for name, param in model.llm.named_parameters()
+        if param.requires_grad and "lora_" in name
+    ]
 
 
 def save_hybrid_checkpoint(model: DINOv3QwenXAttn, checkpoint_dir: str) -> None:
