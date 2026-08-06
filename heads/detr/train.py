@@ -87,9 +87,9 @@ def main():
 
     detr_decoder = build_detr(
         d_model=384,
-        num_layers=4,
+        num_layers=5,
         n_classes=92,
-        n_points=5,
+        n_points=3,
     ).to(device)
 
     out_path = args.output
