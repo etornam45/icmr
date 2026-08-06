@@ -14,11 +14,13 @@ from dinov3.checkpoints.load import (
 from dinov3.models import vit_small
 from dinov3.utils.device import get_device
 from heads.detr.dataset import make_dataloader
+from heads.detr.download import ensure_coco_split
 from heads.detr.matcher import HungarianLoss
 from heads.detr.transformer import DETR, build_detr
 from logger import SQLiteLogger
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_COCO_ROOT = _REPO_ROOT / "coco"
 BACKBONE_WEIGHTS = str(
     _REPO_ROOT
     / "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
@@ -29,26 +31,35 @@ DEFAULT_OUT_PATH = str(_REPO_ROOT / "dinov3/checkpoints/model/detr_decoder.pt")
 def parse_args():
     parser = argparse.ArgumentParser(description="Train DINOv3 + DETR decoder")
     parser.add_argument(
-        "--img-dir", type=str, default="coco/images/train2017"
+        "--img-dir",
+        type=str,
+        default=str(_COCO_ROOT / "images" / "train2017"),
     )
     parser.add_argument(
         "--ann-file",
         type=str,
-        default="coco/annotations/instances_train2017.json",
+        default=str(_COCO_ROOT / "annotations" / "instances_train2017.json"),
     )
     parser.add_argument(
-        "--val-img-dir", type=str, default="coco/images/val2017"
+        "--val-img-dir",
+        type=str,
+        default=str(_COCO_ROOT / "images" / "val2017"),
     )
     parser.add_argument(
         "--val-ann-file",
         type=str,
-        default="coco/annotations/instances_val2017.json",
+        default=str(_COCO_ROOT / "annotations" / "instances_val2017.json"),
     )
     parser.add_argument(
         "--backbone",
         type=str,
         default=BACKBONE_WEIGHTS,
         help="Path to DINOv3 ViT-S/16 weights (auto-downloads if missing)",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Do not auto-download missing backbone weights or COCO data",
     )
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -69,6 +80,29 @@ def parse_args():
         help="Optional name for the logged training run",
     )
     return parser.parse_args()
+
+
+def _load_backbone(weights: str, device, auto_download: bool = True):
+    model = vit_small(
+        patch_size=16,
+        n_storage_tokens=4,
+        layerscale_init=1e-5,
+        mask_k_bias=True,
+    )
+    if Path(weights).exists() and not validate_checkpoint_file(
+        weights, expected_sha256=None
+    ):
+        print(
+            f"Warning: checkpoint at {weights} looks corrupt, re-downloading"
+        )
+        Path(weights).unlink(missing_ok=True)
+    weights = ensure_backbone_checkpoint(weights, auto_download=auto_download)
+    load_checkpoint(model, weights)
+    model.to(device)
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    return model
 
 
 def train_step(model: DETR, img_embed, target, lf: HungarianLoss):
@@ -106,6 +140,17 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
+    auto_download = not args.no_download
+    if auto_download:
+        ensure_coco_split(args.img_dir, args.ann_file)
+        ensure_coco_split(args.val_img_dir, args.val_ann_file)
+
+    dinov3_small = _load_backbone(
+        args.backbone, device, auto_download=auto_download
+    )
+    total = sum(p.numel() for p in dinov3_small.parameters())
+    print(f"Total backbone parameters: {total / 1e6:.1f}M")
+
     train_loader, num_train_batches = make_dataloader(
         args.img_dir,
         args.ann_file,
@@ -123,36 +168,13 @@ def main():
     print("Train batches per epoch:", num_train_batches)
     print("Val batches:", num_val_batches)
 
-    dinov3_small = vit_small(
-        patch_size=16,
-        n_storage_tokens=4,
-        layerscale_init=1e-5,
-        mask_k_bias=True,
-    )
-    backbone_weights = args.backbone
-    if Path(backbone_weights).exists() and not validate_checkpoint_file(
-        backbone_weights, expected_sha256=None
-    ):
-        print(
-            f"Warning: checkpoint at {backbone_weights} looks corrupt, "
-            "re-downloading"
-        )
-        Path(backbone_weights).unlink(missing_ok=True)
-    backbone_weights = ensure_backbone_checkpoint(backbone_weights)
-    load_checkpoint(dinov3_small, backbone_weights)
-    dinov3_small.to(device)
-    dinov3_small.eval()
-    for p in dinov3_small.parameters():
-        p.requires_grad = False
-
-    total = sum(p.numel() for p in dinov3_small.parameters())
-    print(f"Total backbone parameters: {total / 1e6:.1f}M")
-
     detr_decoder = build_detr(
         d_model=384,
-        num_layers=5,
+        num_layers=6,
         n_classes=92,
-        n_points=3,
+        n_heads=8,
+        n_queries=50,
+        n_points=4,
     ).to(device)
 
     out_path = args.output
