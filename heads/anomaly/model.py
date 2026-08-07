@@ -1,4 +1,8 @@
-"""DINOv3 weakly-supervised temporal anomaly localizer (WTAL)."""
+"""DINOv3 patch-token video anomaly classifier (head only).
+
+The shared backbone in ``heads.backbone`` encodes frames; this module
+consumes ``patch_tokens`` and predicts a video-level class.
+"""
 
 from __future__ import annotations
 
@@ -7,185 +11,133 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from dinov3.checkpoints.load import (
-    ensure_backbone_checkpoint,
-    load_checkpoint,
-    validate_checkpoint_file,
-)
-from dinov3.models import vit_small
-from heads.anomaly.decode import (
-    actionness_from_probs,
-    decode_segments,
-    fuse_pyramid_probs,
-)
-from heads.anomaly.heads import BoundaryHead, ClassificationHead
-from heads.anomaly.losses import SVDDRegularizer
-from heads.anomaly.pyramid import FeaturePyramid1D
-from heads.anomaly.temporal import TemporalAggregator
+from heads.backbone import IMG_SIZE, PATCH_SIZE, VISION_DIM
+from heads.vqa.vau_dataset import save_label_maps
 
-ARCHITECTURE = "temporal_wtal_v1"
-BACKBONE_WEIGHTS = "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+ARCHITECTURE = "patch_transformer_v1"
 DEFAULT_CHECKPOINT_DIR = "dinov3/checkpoints/model/anomaly_vau"
-VISION_DIM = 384
-IMG_SIZE = 224
 DEFAULT_NUM_FRAMES = 16
-DEFAULT_STRIDES = (1, 2, 4, 8)
+PATCHES_PER_FRAME = (IMG_SIZE // PATCH_SIZE) ** 2
 
 
-class DINOv3AnomalyLocalizer(nn.Module):
-    """Frozen DINOv3 CLS → temporal aggregator → pyramid → CAS head.
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for batch-first sequences (B, L, D)."""
 
-    Boundary regression head is present but inactive (``boundary.enabled=False``).
-    """
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        encoding = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float()
+            * (-torch.log(torch.tensor(10000.0)) / d_model)
+        )
+        encoding[:, 0::2] = torch.sin(position * div_term)
+        encoding[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("encoding", encoding.unsqueeze(0))  # (1, max_len, D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.encoding[:, : x.size(1)]
+
+
+class AnomalyClassifier(nn.Module):
+    """Transformer over DINOv3 patch tokens → video-level class logits."""
 
     def __init__(
         self,
-        vision_model: nn.Module,
-        num_classes: int,
         vision_dim: int = VISION_DIM,
+        num_classes: int = 12,
+        num_frames: int = DEFAULT_NUM_FRAMES,
+        num_layers: int = 2,
+        n_heads: int = 8,
+        patches_per_frame: int = PATCHES_PER_FRAME,
         hidden_dim: int = 256,
-        strides: tuple[int, ...] = DEFAULT_STRIDES,
-        normal_index: int = 0,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.architecture = ARCHITECTURE
-        self.vision_model = vision_model
         self.num_classes = num_classes
+        self.num_frames = num_frames
+        self.patches_per_frame = patches_per_frame
         self.vision_dim = vision_dim
         self.hidden_dim = hidden_dim
-        self.strides = tuple(strides)
-        self.normal_index = normal_index
 
-        self.aggregator = TemporalAggregator(dim=vision_dim)
-        self.pyramid = FeaturePyramid1D(dim=vision_dim, strides=self.strides)
-        self.cls_head = ClassificationHead(
-            dim=vision_dim, num_classes=num_classes, hidden_dim=hidden_dim
+        self.spatial_embed = PositionalEncoding(vision_dim, max_len=patches_per_frame)
+        self.temporal_embed = PositionalEncoding(vision_dim, max_len=num_frames)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=vision_dim,
+            nhead=n_heads,
+            dim_feedforward=vision_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.boundary = BoundaryHead(dim=vision_dim, hidden_dim=hidden_dim)
-        self.boundary.enabled = False
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.svdd = SVDDRegularizer(dim=vision_dim)
-        self.svdd.attach(self)
+        self.cls_head = nn.Sequential(
+            nn.LayerNorm(vision_dim),
+            nn.Linear(vision_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
 
-    def encode_cls(self, videos: torch.Tensor) -> torch.Tensor:
-        """videos [B,T,3,H,W] → CLS [B,T,D] (backbone frozen)."""
-        if videos.dim() == 4:
-            videos = videos.unsqueeze(1)
-        if videos.dim() != 5:
-            raise ValueError(
-                f"Expected video tensor [B, T, 3, H, W], got shape {tuple(videos.shape)}"
-            )
-        batch_size, num_frames, channels, height, width = videos.shape
-        flat = videos.reshape(batch_size * num_frames, channels, height, width)
-        with torch.no_grad():
-            features = self.vision_model(flat, masks=None, is_training=True)
-            cls_tokens = features["x_norm_clstoken"]
-        return cls_tokens.view(batch_size, num_frames, -1)
-
-    def forward_from_cls(self, cls_tokens: torch.Tensor) -> dict[str, object]:
+    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            cls_tokens: [B, T, D]
-
+            patch_tokens: (B, T, P, D) from ``heads.backbone.encode_frames``
         Returns:
-            embeddings: [B, T, D] post-aggregator
-            level_logits: list of [B, T_s, C]
-            cas_logits: [B, T, C] stride-1
-            fused_probs: [B, T, C]
-            actionness: [B, T]
+            logits: (B, C)
         """
-        if cls_tokens.dim() == 2:
-            cls_tokens = cls_tokens.unsqueeze(0)
-        embeddings = self.aggregator(cls_tokens)
-        levels = self.pyramid(embeddings)
-        level_logits = [self.cls_head(level) for level in levels]
-        cas_logits = level_logits[0]
-        fused_probs = fuse_pyramid_probs(level_logits, target_length=cas_logits.shape[1])
-        actionness = actionness_from_probs(fused_probs, self.normal_index)
-        return {
-            "embeddings": embeddings,
-            "level_logits": level_logits,
-            "cas_logits": cas_logits,
-            "fused_probs": fused_probs,
-            "actionness": actionness,
-        }
+        b, t, p, d = patch_tokens.shape
+        if t != self.num_frames:
+            raise ValueError(f"expected {self.num_frames} frames, got {t}")
+        if p != self.patches_per_frame:
+            raise ValueError(f"expected {self.patches_per_frame} patches/frame, got {p}")
 
-    def forward(self, videos: torch.Tensor) -> dict[str, object]:
-        cls_tokens = self.encode_cls(videos)
-        return self.forward_from_cls(cls_tokens)
-
-    def video_logits(self, cas_logits: torch.Tensor, k_ratio: float = 1.0 / 8.0):
-        """Top-k pooled video-level logits [B, C] for classification metrics."""
-        import math
-
-        _batch, num_steps, _c = cas_logits.shape
-        k = max(1, math.ceil(num_steps * k_ratio))
-        topk_vals, _ = torch.topk(cas_logits.transpose(1, 2), k=k, dim=-1)
-        return topk_vals.mean(dim=-1)
+        x = patch_tokens.reshape(b * t, p, d)
+        x = self.spatial_embed(x).view(b, t, p, d)
+        x = x + self.temporal_embed.encoding[:, :t].unsqueeze(2)
+        x = self.transformer(x.view(b, t * p, d))
+        return self.cls_head(x.mean(dim=1))
 
 
-# Back-compat alias used by older imports / type hints.
-DINOv3AnomalyClassifier = DINOv3AnomalyLocalizer
+# Back-compat aliases.
+DINOv3AnomalyClassifier = AnomalyClassifier
+DINOv3AnomalyLocalizer = AnomalyClassifier
 
 
-def localizer_trainable_params(model: DINOv3AnomalyLocalizer):
-    params = (
-        list(model.aggregator.parameters())
-        + list(model.pyramid.parameters())
-        + list(model.cls_head.parameters())
-    )
-    if model.boundary.enabled:
-        params += list(model.boundary.parameters())
-    return params
+def classifier_trainable_params(model: AnomalyClassifier):
+    return list(model.parameters())
 
 
-# Alias for older train script name.
-classifier_trainable_params = localizer_trainable_params
+localizer_trainable_params = classifier_trainable_params
 
 
 def build_anomaly_model(
     device: torch.device,
     num_classes: int,
-    backbone_weights: str = BACKBONE_WEIGHTS,
+    num_frames: int = DEFAULT_NUM_FRAMES,
     hidden_dim: int = 256,
-    vision_model: nn.Module | None = None,
-    normal_index: int = 0,
-    strides: tuple[int, ...] = DEFAULT_STRIDES,
-) -> DINOv3AnomalyLocalizer:
-    if vision_model is None:
-        vision_model = vit_small(
-            patch_size=16,
-            n_storage_tokens=4,
-            layerscale_init=1e-5,
-            mask_k_bias=True,
-        )
-        if Path(backbone_weights).exists() and not validate_checkpoint_file(
-            backbone_weights, expected_sha256=None
-        ):
-            print(
-                f"Warning: checkpoint at {backbone_weights} looks corrupt, re-downloading"
-            )
-            Path(backbone_weights).unlink(missing_ok=True)
-
-        backbone_weights = ensure_backbone_checkpoint(backbone_weights)
-        load_checkpoint(vision_model, backbone_weights)
-        vision_model.to(device)
-        vision_model.eval()
-        for param in vision_model.parameters():
-            param.requires_grad = False
-
-    model = DINOv3AnomalyLocalizer(
-        vision_model=vision_model,
+    num_layers: int = 2,
+    n_heads: int = 8,
+    **_legacy_kwargs,
+) -> AnomalyClassifier:
+    """Build the anomaly head only (no backbone)."""
+    del _legacy_kwargs
+    return AnomalyClassifier(
+        vision_dim=VISION_DIM,
         num_classes=num_classes,
+        num_frames=num_frames,
+        num_layers=num_layers,
+        n_heads=n_heads,
         hidden_dim=hidden_dim,
-        strides=strides,
-        normal_index=normal_index,
     ).to(device)
-    return model
 
 
 def save_anomaly_checkpoint(
-    model: DINOv3AnomalyLocalizer,
+    model: AnomalyClassifier,
     checkpoint_dir: str | Path,
     label2id: dict[str, int],
 ) -> None:
@@ -194,27 +146,19 @@ def save_anomaly_checkpoint(
     torch.save(
         {
             "architecture": ARCHITECTURE,
-            "aggregator": model.aggregator.state_dict(),
-            "pyramid": model.pyramid.state_dict(),
-            "cls_head": model.cls_head.state_dict(),
-            "boundary": model.boundary.state_dict(),
-            "svdd_center": model.svdd_center.detach().cpu(),
-            "svdd_initialized": int(model.svdd_initialized.item()),
+            "classifier": model.state_dict(),
             "num_classes": model.num_classes,
+            "num_frames": model.num_frames,
             "hidden_dim": model.hidden_dim,
-            "strides": list(model.strides),
-            "normal_index": model.normal_index,
             "label2id": label2id,
         },
         path / "classifier.pt",
     )
-    from heads.vqa.vau_dataset import save_label_maps
-
     save_label_maps(label2id, path / "label2id.json")
 
 
 def load_anomaly_checkpoint(
-    model: DINOv3AnomalyLocalizer,
+    model: AnomalyClassifier,
     checkpoint_dir: str | Path,
     device: torch.device,
 ) -> dict[str, int]:
@@ -230,10 +174,9 @@ def load_anomaly_checkpoint(
             f"Checkpoint architecture={arch!r} is incompatible with "
             f"{ARCHITECTURE!r}. Retrain with heads.anomaly.train."
         )
-    # Legacy mean-pool checkpoints have "norm"/"head" and no architecture key.
-    if "aggregator" not in state:
+    if "classifier" not in state:
         raise RuntimeError(
-            "Legacy mean-pool anomaly checkpoint detected. "
+            "Legacy WTAL / mean-pool anomaly checkpoint detected. "
             f"Retrain for {ARCHITECTURE}."
         )
 
@@ -243,85 +186,21 @@ def load_anomaly_checkpoint(
             f"Checkpoint num_classes={num_classes} != model "
             f"num_classes={model.num_classes}"
         )
-    model.aggregator.load_state_dict(state["aggregator"])
-    model.pyramid.load_state_dict(state["pyramid"])
-    model.cls_head.load_state_dict(state["cls_head"])
-    if "boundary" in state:
-        model.boundary.load_state_dict(state["boundary"])
-    if "svdd_center" in state:
-        model.svdd_center.copy_(state["svdd_center"].to(device))
-        model.svdd_initialized.fill_(int(state.get("svdd_initialized", 0)))
-    if "normal_index" in state:
-        model.normal_index = int(state["normal_index"])
+    ckpt_frames = state.get("num_frames")
+    if ckpt_frames is not None and int(ckpt_frames) != model.num_frames:
+        raise RuntimeError(
+            f"Checkpoint num_frames={ckpt_frames} != model "
+            f"num_frames={model.num_frames}"
+        )
+
+    model.load_state_dict(state["classifier"])
     label2id = {str(k): int(v) for k, v in state["label2id"].items()}
     return label2id
 
 
-def localize_from_cls(
-    model: DINOv3AnomalyLocalizer,
-    cls_tokens: torch.Tensor,
-    id2label: dict[int, str],
-    window_duration: float,
-    nms_sigma: float = 0.5,
-    nms_floor: float = 0.05,
-    deploy_threshold: float = 0.0,
-) -> dict:
-    """Run localization from precomputed CLS tokens (shared-backbone path)."""
-    out = model.forward_from_cls(cls_tokens)
-    level_logits = out["level_logits"]
-    # decode expects batch dim; take first item levels as list of [1,T,C]
-    segments = decode_segments(
-        [logits[:1] for logits in level_logits],
-        id2label=id2label,
-        normal_index=model.normal_index,
-        window_duration=window_duration,
-        nms_sigma=nms_sigma,
-        nms_floor=nms_floor,
-        deploy_threshold=deploy_threshold,
-    )
-    video_logits = model.video_logits(out["cas_logits"])
-    probs = torch.softmax(video_logits[0], dim=-1)
-    top_prob, top_idx = probs.max(dim=-1)
-    prediction = id2label[int(top_idx.item())]
-    actionness = out["actionness"][0].detach().float().cpu()
-    svdd_dist = model.svdd.distances(out["embeddings"])[0].detach().float().cpu()
-    return {
-        "prediction": prediction,
-        "score": float(top_prob.item()),
-        "segments": segments,
-        "actionness": actionness,
-        "svdd_distance": float(svdd_dist.mean().item()),
-        "top_k": [
-            {"class": id2label[int(i)], "probability": float(probs[int(i)].item())}
-            for i in torch.topk(probs, k=min(5, probs.numel())).indices.tolist()
-        ],
-    }
-
-
 if __name__ == "__main__":
-    device = torch.device("cpu")
-    # Tiny smoke without loading real backbone weights.
-    class _FakeVision(nn.Module):
-        def forward(self, x, masks=None, is_training=True):
-            b = x.shape[0]
-            return {
-                "x_norm_clstoken": torch.randn(b, VISION_DIM),
-            }
-
-    model = DINOv3AnomalyLocalizer(
-        vision_model=_FakeVision(),
-        num_classes=12,
-        normal_index=7,
-    )
-    videos = torch.randn(2, DEFAULT_NUM_FRAMES, 3, 32, 32)
-    # Bypass encode (fake vision ignores spatial size) via forward_from_cls
-    cls = torch.randn(2, DEFAULT_NUM_FRAMES, VISION_DIM)
-    out = model.forward_from_cls(cls)
-    assert out["cas_logits"].shape == (2, DEFAULT_NUM_FRAMES, 12)
-    assert len(out["level_logits"]) == 4
-    print(
-        "smoke ok:",
-        f"cas={tuple(out['cas_logits'].shape)}",
-        f"levels={[tuple(x.shape) for x in out['level_logits']]}",
-        f"actionness={tuple(out['actionness'].shape)}",
-    )
+    model = AnomalyClassifier(num_classes=12, num_frames=DEFAULT_NUM_FRAMES)
+    patches = torch.randn(2, DEFAULT_NUM_FRAMES, PATCHES_PER_FRAME, VISION_DIM)
+    out = model(patches)
+    assert out.shape == (2, 12), out.shape
+    print(f"ok: {tuple(out.shape)}")

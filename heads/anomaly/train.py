@@ -1,4 +1,4 @@
-"""Train DINOv3 WTAL anomaly localizer on VAU-Bench UCF video-level labels."""
+"""Train DINOv3 patch-transformer anomaly classifier on VAU-Bench UCF labels."""
 
 from __future__ import annotations
 
@@ -7,27 +7,28 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import optim
 from tqdm import tqdm
 
 from dinov3.utils.device import get_device
 from heads.anomaly.dataset import build_train_label_maps
-from heads.anomaly.losses import mil_ranking_loss, topk_mil_loss
 from heads.anomaly.model import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_NUM_FRAMES,
     build_anomaly_model,
+    classifier_trainable_params,
     load_anomaly_checkpoint,
-    localizer_trainable_params,
     save_anomaly_checkpoint,
 )
+from heads.backbone import build_backbone, encode_frames
 from heads.vqa.vau_dataset import DEFAULT_CACHE_DIR, make_vau_class_dataloader
 from logger import SQLiteLogger
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train DINOv3 WTAL anomaly localizer on VAU-Bench (UCF)"
+        description="Train DINOv3 anomaly classifier on VAU-Bench (UCF)"
     )
     parser.add_argument("--video-root", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default=DEFAULT_CACHE_DIR)
@@ -49,35 +50,19 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=str, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--lambda-topk", type=float, default=1.0)
-    parser.add_argument("--lambda-mil", type=float, default=1.0)
-    parser.add_argument("--lambda-svdd", type=float, default=0.1)
     parser.add_argument("--log-db", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     return parser.parse_args()
 
 
-def _normal_index(label2id: dict[str, int]) -> int:
-    for key in ("Normal", "normal", "Normal_Videos"):
-        if key in label2id:
-            return label2id[key]
-    # Fallback: last resort — prefer any label containing 'normal'
-    for name, idx in label2id.items():
-        if "normal" in name.lower():
-            return idx
-    raise KeyError(f"No Normal class in label2id: {sorted(label2id)}")
-
-
-def train_epoch(model, loader, optimizer, device, args, normal_index: int):
+def train_epoch(model, backbone, loader, optimizer, device):
     model.train()
-    model.vision_model.eval()
+    backbone.eval()
     total_loss = 0.0
-    total_topk = 0.0
-    total_mil = 0.0
-    total_svdd = 0.0
     correct = 0
     total = 0
 
@@ -85,44 +70,21 @@ def train_epoch(model, loader, optimizer, device, args, normal_index: int):
     for batch in pbar:
         videos = batch["video"].to(device)
         labels = batch["label"].to(device)
-        is_anomaly = labels != normal_index
+        feats = encode_frames(backbone, videos)
 
         optimizer.zero_grad()
-        out = model(videos)
-        cas = out["cas_logits"]
-        actionness = out["actionness"]
-        embeddings = out["embeddings"]
-
-        loss_topk = topk_mil_loss(cas, labels)
-        loss_mil = mil_ranking_loss(actionness, is_anomaly)
-        # SVDD on confirmed-normal embeddings only
-        if (~is_anomaly).any():
-            normal_emb = embeddings[~is_anomaly]
-            model.svdd.update_center(normal_emb)
-            loss_svdd = model.svdd.loss(normal_emb)
-        else:
-            loss_svdd = cas.new_zeros(())
-
-        loss = (
-            args.lambda_topk * loss_topk
-            + args.lambda_mil * loss_mil
-            + args.lambda_svdd * loss_svdd
-        )
+        logits = model(feats["patch_tokens"])
+        loss = F.cross_entropy(logits, labels)
         if not torch.isfinite(loss):
             print("Warning: non-finite loss, skipping batch")
             continue
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(localizer_trainable_params(model), 1.0)
+        torch.nn.utils.clip_grad_norm_(classifier_trainable_params(model), 1.0)
         optimizer.step()
 
         n = labels.size(0)
         total_loss += loss.item() * n
-        total_topk += float(loss_topk.item()) * n
-        total_mil += float(loss_mil.item()) * n
-        total_svdd += float(loss_svdd.item()) * n
-
-        video_logits = model.video_logits(cas)
-        preds = video_logits.argmax(dim=-1)
+        preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
         total += n
         pbar.set_postfix(
@@ -132,16 +94,14 @@ def train_epoch(model, loader, optimizer, device, args, normal_index: int):
 
     return {
         "loss": total_loss / max(total, 1),
-        "topk": total_topk / max(total, 1),
-        "mil": total_mil / max(total, 1),
-        "svdd": total_svdd / max(total, 1),
         "accuracy": correct / max(total, 1),
     }
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, normal_index: int):
+def evaluate(model, backbone, loader, device):
     model.eval()
+    backbone.eval()
     total_loss = 0.0
     correct = 0
     total = 0
@@ -150,13 +110,12 @@ def evaluate(model, loader, device, normal_index: int):
     for batch in tqdm(loader, desc="Evaluating", leave=False):
         videos = batch["video"].to(device)
         labels = batch["label"].to(device)
-        out = model(videos)
-        cas = out["cas_logits"]
-        loss = topk_mil_loss(cas, labels)
-        video_logits = model.video_logits(cas)
+        feats = encode_frames(backbone, videos)
+        logits = model(feats["patch_tokens"])
+        loss = F.cross_entropy(logits, labels)
 
         total_loss += loss.item() * labels.size(0)
-        preds = video_logits.argmax(dim=-1)
+        preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
         for pred, label in zip(preds.tolist(), labels.tolist()):
@@ -183,7 +142,6 @@ def evaluate(model, loader, device, normal_index: int):
         "macro_recall": sum(recalls) / max(len(recalls), 1),
         "macro_f1": sum(f1s) / max(len(f1s), 1),
         "num_samples": total,
-        "normal_index": normal_index,
     }
 
 
@@ -194,15 +152,15 @@ def main():
     print(f"Using device: {device}")
 
     label2id, _id2label = build_train_label_maps(args.cache_dir, sources=sources)
-    normal_index = _normal_index(label2id)
     print(f"Anomaly classes ({len(label2id)}): {sorted(label2id)}")
-    print(f"Normal index: {normal_index}")
 
+    backbone = build_backbone(device)
     model = build_anomaly_model(
         device,
         num_classes=len(label2id),
+        num_frames=args.num_frames,
         hidden_dim=args.hidden_dim,
-        normal_index=normal_index,
+        num_layers=args.num_layers,
     )
 
     if args.resume:
@@ -223,7 +181,7 @@ def main():
     print(f"Train batches: {len(train_loader)}")
 
     optimizer = optim.AdamW(
-        localizer_trainable_params(model),
+        classifier_trainable_params(model),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -246,7 +204,7 @@ def main():
     try:
         for epoch in range(args.epochs):
             train_metrics = train_epoch(
-                model, train_loader, optimizer, device, args, normal_index
+                model, backbone, train_loader, optimizer, device
             )
 
             eval_loader, _ = make_vau_class_dataloader(
@@ -261,15 +219,12 @@ def main():
                 skip_missing=args.skip_missing_videos,
                 sources=sources,
             )
-            metrics = evaluate(model, eval_loader, device, normal_index)
+            metrics = evaluate(model, backbone, eval_loader, device)
             del eval_loader
 
             print(
                 f"Epoch {epoch + 1}/{args.epochs}: "
-                f"train_loss={train_metrics['loss']:.4f} "
-                f"(topk={train_metrics['topk']:.4f}, "
-                f"mil={train_metrics['mil']:.4f}, "
-                f"svdd={train_metrics['svdd']:.4f}), "
+                f"train_loss={train_metrics['loss']:.4f}, "
                 f"train_acc={train_metrics['accuracy']:.3f}, "
                 f"eval_loss={metrics['loss']:.4f}, "
                 f"eval_acc={metrics['accuracy']:.3f}, "
@@ -280,9 +235,6 @@ def main():
                 logger.log_metrics(
                     {
                         "train/loss": train_metrics["loss"],
-                        "train/topk": train_metrics["topk"],
-                        "train/mil": train_metrics["mil"],
-                        "train/svdd": train_metrics["svdd"],
                         "train/accuracy": train_metrics["accuracy"],
                         "eval/loss": metrics["loss"],
                         "eval/accuracy": metrics["accuracy"],

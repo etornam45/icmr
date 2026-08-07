@@ -28,8 +28,7 @@ __all__ = [
 
 
 # Note: VAU UCF train/val have no temporal spans. Frame sampling uses the full
-# video (start/end = -1). Native Temporal_Anomaly_Annotation.txt is eval-only —
-# see heads.anomaly.ucf_temporal / eval_localization.
+# video (start/end = -1); supervision is video-level anomaly class only.
 
 
 def build_train_label_maps(
