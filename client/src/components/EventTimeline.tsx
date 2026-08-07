@@ -1,12 +1,14 @@
-import { useState } from 'react'
-import type { EventItem } from '../api'
+import { useState } from "react";
+import type { EventItem } from "../api";
+import { FileDown } from "lucide-react";
+import { downloadReport } from "../report";
 
 type Props = {
-  events: EventItem[]
-}
+  events: EventItem[];
+};
 
 export function EventTimeline({ events }: Props) {
-  const [openId, setOpenId] = useState<number | null>(null)
+  const [openId, setOpenId] = useState<number | null>(null);
 
   if (events.length === 0) {
     return (
@@ -14,15 +16,29 @@ export function EventTimeline({ events }: Props) {
         <h2>Events</h2>
         <p>No anomalies recorded yet.</p>
       </div>
-    )
+    );
   }
 
   return (
     <div className="timeline">
-      <h2>Events</h2>
+      <div className="timeline-head">
+        <h2>Events</h2>
+        <button
+          type="button"
+          className="report-btn"
+          onClick={() => downloadReport(events)}
+          disabled={events.length === 0}
+          title={
+            events.length ? "Download event report" : "No events to report"
+          }
+        >
+          <FileDown size={13} />
+          <span>Report</span>
+        </button>
+      </div>
       <ul>
         {events.map((ev) => {
-          const open = openId === ev.id
+          const open = openId === ev.id;
           return (
             <li key={ev.id}>
               <button
@@ -36,13 +52,13 @@ export function EventTimeline({ events }: Props) {
               </button>
               {open && (
                 <p className="event-caption">
-                  {ev.caption ?? 'Caption pending…'}
+                  {ev.caption ?? "Caption pending…"}
                 </p>
               )}
             </li>
-          )
+          );
         })}
       </ul>
     </div>
-  )
+  );
 }

@@ -427,13 +427,41 @@ select {
   padding: 1rem 1.1rem 1.5rem;
 }
 
-.timeline h2 {
+.timeline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.85rem;
+}
+
+.timeline-head h2 {
   margin: 0 0 0.85rem;
   font-size: 0.75rem;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--muted);
   font-weight: 600;
+}
+
+.report-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.55rem;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.report-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .timeline.empty p {
