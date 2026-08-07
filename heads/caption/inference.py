@@ -1,9 +1,11 @@
 from pathlib import Path
 
 import torch
+from torch import nn
 from transformers import PreTrainedTokenizer
 
 from dinov3.utils.device import get_device
+from heads.backbone import IMG_SIZE, build_backbone, encode_frames
 from heads.vqa.dataset import (
     DEFAULT_NUM_FRAMES,
     encode_user_prompt,
@@ -11,7 +13,6 @@ from heads.vqa.dataset import (
 )
 from heads.vqa.model import (
     DEFAULT_CHECKPOINT_DIR,
-    IMG_SIZE,
     DINOv3QwenXAttn,
     build_hybrid_model,
     decode_generated_answer,
@@ -37,6 +38,7 @@ def generate_caption(
     videos: torch.Tensor,
     question: str | None = None,
     max_new_tokens: int = 128,
+    backbone: nn.Module | None = None,
 ) -> str:
     """Caption a video tensor [B, T, 3, H, W] or [T, 3, H, W] with a loaded model."""
     if videos.dim() == 4:
@@ -45,13 +47,18 @@ def generate_caption(
         question = CAPTION_PROMPT
 
     device = videos.device
+    if backbone is None:
+        backbone = build_backbone(device)
+    feats = encode_frames(backbone, videos)
+
     prompt = encode_user_prompt(tokenizer, [question], device)
     prompt_len = prompt["input_ids"].shape[1]
 
     gen_ids = model.generate(
-        videos,
+        feats["patch_tokens"],
         prompt["input_ids"],
         attention_mask=prompt["attention_mask"],
+        cls_tokens=feats["cls_tokens"],
         max_new_tokens=max_new_tokens,
         num_beams=1,
     )
@@ -68,6 +75,7 @@ def run_inference(
     end_sec: float | None = None,
     model: DINOv3QwenXAttn | None = None,
     tokenizer: PreTrainedTokenizer | None = None,
+    backbone: nn.Module | None = None,
 ) -> str:
     device = get_device()
 
@@ -86,6 +94,9 @@ def run_inference(
         )
         model.eval()
 
+    if backbone is None:
+        backbone = build_backbone(device)
+
     frames = load_video_frames(
         video_path,
         num_frames=num_frames,
@@ -100,6 +111,7 @@ def run_inference(
         frames,
         question=question,
         max_new_tokens=max_new_tokens,
+        backbone=backbone,
     )
     print(f"Generated answer: {answer}")
     return answer
@@ -119,40 +131,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-question",
         action="store_true",
-        help="Force the fixed VAU-Bench Description caption prompt",
+        help="Force the default caption prompt",
     )
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT_DIR)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument(
-        "--start-sec",
-        type=float,
-        default=None,
-        help="Optional anomaly start time (seconds) for trim sampling",
-    )
-    parser.add_argument(
-        "--end-sec",
-        type=float,
-        default=None,
-        help="Optional anomaly end time (seconds) for trim sampling",
-    )
+    parser.add_argument("--start-sec", type=float, default=None)
+    parser.add_argument("--end-sec", type=float, default=None)
     args = parser.parse_args()
 
-    question = CAPTION_PROMPT if args.no_question else args.question
-    checkpoint = Path(args.checkpoint)
-    best = checkpoint.parent / f"{checkpoint.name}_best"
-    if not checkpoint.exists() and not best.exists():
-        print(
-            f"Checkpoint not found at {args.checkpoint}. "
-            "Run python -m heads.vqa.train first."
-        )
-    else:
-        run_inference(
-            video_path=args.video,
-            question=question,
-            max_new_tokens=args.max_new_tokens,
-            num_frames=args.num_frames,
-            checkpoint_dir=args.checkpoint,
-            start_sec=args.start_sec,
-            end_sec=args.end_sec,
-        )
+    question = None if args.no_question else args.question
+    run_inference(
+        video_path=args.video,
+        question=question,
+        max_new_tokens=args.max_new_tokens,
+        num_frames=args.num_frames,
+        checkpoint_dir=args.checkpoint,
+        start_sec=args.start_sec,
+        end_sec=args.end_sec,
+    )

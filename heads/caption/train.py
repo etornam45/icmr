@@ -7,6 +7,7 @@ from torch import optim
 from tqdm import tqdm
 
 from dinov3.utils.device import get_device
+from heads.backbone import build_backbone, encode_frames
 from heads.vqa.dataset import (
     DEFAULT_CACHE_DIR as CUVA_CACHE_DIR,
 )
@@ -257,9 +258,9 @@ def build_optimizer(
     return optim.AdamW(groups, weight_decay=weight_decay, foreach=False)
 
 
-def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
+def train_epoch(model, backbone, loader, optimizer, device, desc: str = "Training"):
     model.train()
-    model.vision_model.eval()
+    backbone.eval()
     total_loss = 0.0
     num_batches = 0
 
@@ -269,13 +270,20 @@ def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        feats = encode_frames(backbone, videos)
 
         optimizer.zero_grad(set_to_none=True)
-        outputs = model(videos, input_ids, attention_mask, labels=labels)
+        outputs = model(
+            feats["patch_tokens"],
+            input_ids,
+            attention_mask,
+            labels=labels,
+            cls_tokens=feats["cls_tokens"],
+        )
         loss = outputs.loss
         if not torch.isfinite(loss):
             print("Warning: non-finite loss, skipping batch")
-            del outputs, videos, input_ids, attention_mask, labels
+            del outputs, videos, input_ids, attention_mask, labels, feats
             continue
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -286,7 +294,7 @@ def train_epoch(model, loader, optimizer, device, desc: str = "Training"):
         total_loss += loss.item()
         num_batches += 1
         pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / num_batches:.4f}")
-        del outputs, loss, videos, input_ids, attention_mask, labels
+        del outputs, loss, videos, input_ids, attention_mask, labels, feats
 
     return total_loss / max(num_batches, 1)
 
@@ -304,12 +312,14 @@ def _gen_sample_batch_indices(num_batches: int, max_samples: int) -> set[int]:
 @torch.no_grad()
 def evaluate(
     model,
+    backbone,
     loader,
     tokenizer,
     device,
     max_gen_samples: int = 4,
 ):
     model.eval()
+    backbone.eval()
     total_loss = 0.0
     references = []
     hypotheses = []
@@ -323,8 +333,15 @@ def evaluate(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        feats = encode_frames(backbone, videos)
 
-        outputs = model(videos, input_ids, attention_mask, labels=labels)
+        outputs = model(
+            feats["patch_tokens"],
+            input_ids,
+            attention_mask,
+            labels=labels,
+            cls_tokens=feats["cls_tokens"],
+        )
         total_loss += outputs.loss.item()
         del outputs
 
@@ -332,9 +349,10 @@ def evaluate(
             prompt = encode_user_prompt(tokenizer, [batch["question"][0]], device)
             prompt_len = prompt["input_ids"].shape[1]
             gen_ids = model.generate(
-                videos[:1],
+                feats["patch_tokens"][:1],
                 prompt["input_ids"][:1],
                 attention_mask=prompt["attention_mask"][:1],
+                cls_tokens=feats["cls_tokens"][:1],
                 max_new_tokens=128,
                 num_beams=1,
             )
@@ -351,7 +369,7 @@ def evaluate(
             clip_ids.append(clip)
             del gen_ids, prompt
 
-        del videos, input_ids, attention_mask, labels
+        del videos, input_ids, attention_mask, labels, feats
 
     _release_cuda_memory()
     avg_loss = total_loss / max(len(loader), 1)
@@ -372,6 +390,7 @@ def _print_eval_samples(refs, hyps, clip_ids, limit: int = 4):
 def run_eval_epoch(
     args,
     model,
+    backbone,
     tokenizer,
     device,
     logger,
@@ -386,6 +405,7 @@ def run_eval_epoch(
     )
     eval_loss, questions, refs, hyps, clip_ids = evaluate(
         model,
+        backbone,
         eval_loader,
         tokenizer,
         device,
@@ -441,6 +461,7 @@ def main():
     if args.dataset == "vau":
         print(f"Caption prompt: {CAPTION_PROMPT!r}")
 
+    backbone = build_backbone(device)
     model, tokenizer = build_hybrid_model(
         device,
         num_frames=args.num_frames,
@@ -493,6 +514,7 @@ def main():
                 global_epoch += 1
                 train_loss = train_epoch(
                     model,
+                    backbone,
                     train_loader,
                     optimizer,
                     device,
@@ -510,6 +532,7 @@ def main():
                 best_loss, _ = run_eval_epoch(
                     args,
                     model,
+                    backbone,
                     tokenizer,
                     device,
                     logger,
@@ -541,6 +564,7 @@ def main():
                 global_epoch += 1
                 train_loss = train_epoch(
                     model,
+                    backbone,
                     train_loader,
                     optimizer,
                     device,
@@ -558,6 +582,7 @@ def main():
                 best_loss, improved = run_eval_epoch(
                     args,
                     model,
+                    backbone,
                     tokenizer,
                     device,
                     logger,
