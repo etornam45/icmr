@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from heads.backbone import IMG_SIZE, PATCH_SIZE, VISION_DIM
-from heads.vqa.vau_dataset import save_label_maps
+from heads.caption.vau_dataset import save_label_maps
 
 ARCHITECTURE = "patch_transformer_v1"
 DEFAULT_CHECKPOINT_DIR = "dinov3/checkpoints/model/anomaly_vau"

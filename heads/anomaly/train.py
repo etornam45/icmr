@@ -22,7 +22,7 @@ from heads.anomaly.model import (
     save_anomaly_checkpoint,
 )
 from heads.backbone import build_backbone, encode_frames
-from heads.vqa.vau_dataset import DEFAULT_CACHE_DIR, make_vau_class_dataloader
+from heads.caption.vau_dataset import DEFAULT_CACHE_DIR, make_vau_class_dataloader
 from logger import SQLiteLogger
 
 

@@ -1,4 +1,4 @@
-"""Orchestrates capture → inference → websocket broadcast → VQA events."""
+"""Orchestrates capture → inference → websocket broadcast → caption events."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ from typing import Any
 
 from fastapi import WebSocket
 
-from heads.vqa.inference import generate_caption
-from heads.vqa.vau_dataset import CAPTION_PROMPT
+from heads.caption.inference import generate_caption
 from server.capture import CaptureLoop, FrameBuffer, SourceSpec
 from server.config import ServerConfig
 from server.events import EventStore
@@ -19,19 +18,6 @@ from server.pipeline import run_pipeline
 from server.runtime import ModelRuntime
 
 logger = logging.getLogger(__name__)
-
-
-def build_caption_prompt(
-    anomaly_class: str,
-    score: float,
-    class_hint: bool,
-) -> str:
-    if not class_hint:
-        return CAPTION_PROMPT
-    return (
-        f"Predicted category: {anomaly_class} (confidence {score:.2f}).\n"
-        f"{CAPTION_PROMPT}"
-    )
 
 
 class MonitorService:
@@ -52,7 +38,7 @@ class MonitorService:
         self._clients: set[WebSocket] = set()
         self._loop_task: asyncio.Task | None = None
         self._last_anomaly_ts = 0.0
-        self._vqa_busy = False
+        self._caption_busy = False
         self._latest_meta: dict[str, Any] = {
             "anomaly": None,
             "score": None,
@@ -205,7 +191,7 @@ class MonitorService:
                 await self._broadcast(meta)
 
                 if result.is_anomaly:
-                    await self._maybe_trigger_vqa(
+                    await self._maybe_trigger_caption(
                         source_uri=source.uri,
                         anomaly_class=result.anomaly_class or "unknown",
                         score=float(result.anomaly_score or 0.0),
@@ -221,7 +207,7 @@ class MonitorService:
             logger.info("Inference loop cancelled")
             raise
 
-    async def _maybe_trigger_vqa(
+    async def _maybe_trigger_caption(
         self,
         source_uri: str,
         anomaly_class: str,
@@ -235,7 +221,7 @@ class MonitorService:
         now = time.time()
         if now - self._last_anomaly_ts < self.cfg.anomaly_cooldown_sec:
             return
-        if self._vqa_busy:
+        if self._caption_busy:
             return
 
         self._last_anomaly_ts = now
@@ -258,7 +244,7 @@ class MonitorService:
             source=source_uri,
             anomaly_class=anomaly_class,
             score=score,
-            caption=None if self.runtime.has_vqa else "(VQA unavailable)",
+            caption=None if self.runtime.has_caption else "(caption unavailable)",
             start_ts=event_start,
             end_ts=event_end,
             svdd_score=svdd_score,
@@ -270,53 +256,51 @@ class MonitorService:
             }
         )
 
-        if not self.runtime.has_vqa:
+        if not self.runtime.has_caption:
             return
 
-        self._vqa_busy = True
-        n_vqa = max(self.runtime.vqa_num_frames, self.cfg.num_frames)
+        self._caption_busy = True
+        n_frames = max(self.runtime.caption_num_frames, self.cfg.num_frames)
 
-        vqa_frames: list = []
+        caption_frames: list = []
         if event_start is not None and event_end is not None:
-            vqa_frames = self.buffer.sample_time_range(event_start, event_end, n_vqa)
-        if not vqa_frames:
-            vqa_frames = self.buffer.sample_uniform(n_vqa)
+            caption_frames = self.buffer.sample_time_range(
+                event_start, event_end, n_frames
+            )
+        if not caption_frames:
+            caption_frames = self.buffer.sample_uniform(n_frames)
 
-        if not vqa_frames and videos_tensor is not None:
+        if not caption_frames and videos_tensor is not None:
             clip = videos_tensor
-        elif vqa_frames:
-            while len(vqa_frames) < n_vqa:
-                vqa_frames.append(vqa_frames[-1])
+        elif caption_frames:
+            while len(caption_frames) < n_frames:
+                caption_frames.append(caption_frames[-1])
             from server.pipeline import bgr_frames_to_tensor
 
             clip = bgr_frames_to_tensor(
-                vqa_frames, self.cfg.img_size, self.runtime.device
+                caption_frames, self.cfg.img_size, self.runtime.device
             ).cpu()
         else:
-            self._vqa_busy = False
+            self._caption_busy = False
             return
-
-        prompt = build_caption_prompt(
-            anomaly_class, score, self.cfg.vqa_class_hint
-        )
 
         async def _run_caption() -> None:
             try:
                 caption = await asyncio.to_thread(
                     generate_caption,
-                    self.runtime.vqa,
-                    self.runtime.vqa_tokenizer,
+                    self.runtime.caption,
+                    self.runtime.caption_tokenizer,
                     clip.to(self.runtime.device),
-                    prompt,
+                    backbone=self.runtime.backbone,
                 )
                 self.events.update_caption(event.id, caption)
                 updated = event.to_dict()
                 updated["caption"] = caption
                 await self._broadcast({"type": "event", "event": updated})
             except Exception:
-                logger.exception("VQA caption failed for event %s", event.id)
+                logger.exception("Caption failed for event %s", event.id)
                 self.events.update_caption(event.id, "(caption failed)")
             finally:
-                self._vqa_busy = False
+                self._caption_busy = False
 
-        asyncio.create_task(_run_caption(), name=f"vqa-event-{event.id}")
+        asyncio.create_task(_run_caption(), name=f"caption-event-{event.id}")

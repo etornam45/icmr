@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from heads.vqa.vau_dataset import (
+from heads.caption.vau_dataset import (
     DEFAULT_CACHE_DIR,
     DEFAULT_NUM_FRAMES,
     IMG_SIZE,

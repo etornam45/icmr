@@ -32,8 +32,9 @@ class ServerConfig:
     backbone_weights: str = "dinov3/checkpoints/model/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
     detr_checkpoint: str = "dinov3/checkpoints/model/detr_decoder.pt"
     anomaly_checkpoint: str = "dinov3/checkpoints/model/anomaly_vau"
-    vqa_checkpoint: str = "dinov3/checkpoints/model/vqa_vau_qwen_best"
-    vqa_fallback_checkpoint: str = "dinov3/checkpoints/model/vqa_vau_qwen"
+    caption_checkpoint: str = "dinov3/checkpoints/model/caption"
+    caption_fallback_checkpoint: str = "dinov3/checkpoints/model/caption_best"
+    caption_tokenizer_dir: str = "dinov3/checkpoints/model/caption/tokenizer"
 
     img_size: int = 224
     num_frames: int = 16
@@ -47,7 +48,6 @@ class ServerConfig:
     nms_sigma: float = 0.5
     span_pad_sec: float = 1.0
     anomaly_cooldown_sec: float = 30.0
-    vqa_class_hint: bool = False
     normal_labels: set[str] = field(
         default_factory=lambda: {
             "Normal",
@@ -64,7 +64,7 @@ class ServerConfig:
     uploads_dir: str = "logs/uploads"
     max_upload_mb: int = 512
     max_events: int = 200
-    load_vqa: bool = True
+    load_caption: bool = True
     default_overlay: str = "none"  # none | detection | pca
 
     host: str = "0.0.0.0"
@@ -78,15 +78,39 @@ class ServerConfig:
         ]
     )
 
+    # Back-compat aliases for older env / attribute names.
+    @property
+    def vqa_checkpoint(self) -> str:
+        return self.caption_checkpoint
+
+    @property
+    def vqa_fallback_checkpoint(self) -> str:
+        return self.caption_fallback_checkpoint
+
+    @property
+    def load_vqa(self) -> bool:
+        return self.load_caption
+
+    @property
+    def vqa_class_hint(self) -> bool:
+        return False
+
 
 def load_config() -> ServerConfig:
     cfg = ServerConfig()
     cfg.backbone_weights = _env_str("ICMR_BACKBONE", cfg.backbone_weights)
     cfg.detr_checkpoint = _env_str("ICMR_DETR", cfg.detr_checkpoint)
     cfg.anomaly_checkpoint = _env_str("ICMR_ANOMALY", cfg.anomaly_checkpoint)
-    cfg.vqa_checkpoint = _env_str("ICMR_VQA", cfg.vqa_checkpoint)
-    cfg.vqa_fallback_checkpoint = _env_str(
-        "ICMR_VQA_FALLBACK", cfg.vqa_fallback_checkpoint
+    cfg.caption_checkpoint = _env_str(
+        "ICMR_CAPTION",
+        _env_str("ICMR_VQA", cfg.caption_checkpoint),
+    )
+    cfg.caption_fallback_checkpoint = _env_str(
+        "ICMR_CAPTION_FALLBACK",
+        _env_str("ICMR_VQA_FALLBACK", cfg.caption_fallback_checkpoint),
+    )
+    cfg.caption_tokenizer_dir = _env_str(
+        "ICMR_CAPTION_TOKENIZER", cfg.caption_tokenizer_dir
     )
     cfg.num_frames = _env_int("ICMR_NUM_FRAMES", cfg.num_frames)
     cfg.inference_interval_sec = _env_float(
@@ -106,12 +130,14 @@ def load_config() -> ServerConfig:
     cfg.anomaly_cooldown_sec = _env_float(
         "ICMR_ANOMALY_COOLDOWN", cfg.anomaly_cooldown_sec
     )
-    cfg.vqa_class_hint = _env_bool("ICMR_VQA_CLASS_HINT", cfg.vqa_class_hint)
     cfg.events_db_path = _env_str("ICMR_EVENTS_DB", cfg.events_db_path)
     cfg.uploads_dir = _env_str("ICMR_UPLOADS_DIR", cfg.uploads_dir)
     cfg.max_upload_mb = _env_int("ICMR_MAX_UPLOAD_MB", cfg.max_upload_mb)
     cfg.default_overlay = _env_str("ICMR_OVERLAY", cfg.default_overlay)
-    cfg.load_vqa = os.getenv("ICMR_LOAD_VQA", "1") not in {"0", "false", "False"}
+    load_caption_env = os.getenv("ICMR_LOAD_CAPTION")
+    if load_caption_env is None:
+        load_caption_env = os.getenv("ICMR_LOAD_VQA", "1")
+    cfg.load_caption = load_caption_env not in {"0", "false", "False"}
     cfg.host = _env_str("ICMR_HOST", cfg.host)
     cfg.port = _env_int("ICMR_PORT", cfg.port)
     return cfg

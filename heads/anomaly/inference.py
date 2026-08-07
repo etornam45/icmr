@@ -16,8 +16,8 @@ from heads.anomaly.model import (
     load_anomaly_checkpoint,
 )
 from heads.backbone import IMG_SIZE, build_backbone, encode_frames
-from heads.vqa.dataset import load_video_frames
-from heads.vqa.vau_dataset import load_label_maps
+from heads.caption.dataset import load_video_frames
+from heads.caption.vau_dataset import load_label_maps
 
 
 def resolve_anomaly_checkpoint(checkpoint_dir: str | Path) -> Path:

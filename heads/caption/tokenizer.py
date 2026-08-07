@@ -237,7 +237,7 @@ def _collect_descriptions(
         raise RuntimeError(
             f"No VAU-Bench descriptions found under {cache_dir} "
             f"(splits={list(splits)}, sources={sources}). "
-            "Run: python -m heads.vqa.vau_dataset --annotations-only --split train"
+            "Run: python -m heads.caption.vau_dataset --annotations-only --split train"
         )
     return texts
 

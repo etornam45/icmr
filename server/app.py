@@ -62,9 +62,9 @@ async def lifespan(app: FastAPI):
     state.runtime = load_runtime(cfg)
     state.monitor = MonitorService(state.runtime, cfg, state.events)
     logger.info(
-        "ICMR server ready (anomaly=%s vqa=%s)",
+        "ICMR server ready (anomaly=%s caption=%s)",
         state.runtime.has_anomaly,
-        state.runtime.has_vqa,
+        state.runtime.has_caption,
     )
     yield
     await state.monitor.stop_source()
@@ -85,7 +85,8 @@ def health():
     return {
         "ok": True,
         "anomaly": state.runtime.has_anomaly if hasattr(state, "runtime") else False,
-        "vqa": state.runtime.has_vqa if hasattr(state, "runtime") else False,
+        "caption": state.runtime.has_caption if hasattr(state, "runtime") else False,
+        "vqa": state.runtime.has_caption if hasattr(state, "runtime") else False,
         "overlay": state.monitor.overlay_mode if hasattr(state, "monitor") else None,
         "source": state.monitor.latest_meta.get("source")
         if hasattr(state, "monitor")

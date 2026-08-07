@@ -1,179 +1,20 @@
-"""CUVA video QA dataset for DINOv3 spatial-pool + MiniCPM."""
+"""Shared video loading utilities for VAU-Bench / UCF-Crime caption training."""
 
 from __future__ import annotations
 
-import zipfile
-from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
-from datasets import load_dataset
-from huggingface_hub import hf_hub_download
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from transformers import PreTrainedTokenizer
 
 from heads.detr.dataset import letterbox
-from heads.vqa.llm_loader import apply_chat, tokenize_chat_pair
 
-HF_REPO_ID = "fesvhtr/CUVA"
-DEFAULT_CACHE_DIR = "data/CUVA"
 IMG_SIZE = 224
 DEFAULT_NUM_FRAMES = 16
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".mpg", ".mpeg"}
-VIDEO_ARCHIVES = tuple(f"raw/group_{index}.zip" for index in range(4))
-PARQUET_FILES = {
-    "full": "data/all.parquet",
-    "test": "data/test.parquet",
-}
-VALID_SPLITS = {"train", "full", "test"}
-TASK_ALIASES = {
-    "T1": "Classification",
-    "T2": "Cause",
-    "T3": "Result",
-    "T4": "Timestamp",
-    "T5": "Description",
-}
-
-
-def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> None:
-    """Extract an archive while rejecting absolute paths and path traversal."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_root = dest_dir.resolve()
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        members = []
-        for member in archive.infolist():
-            member_path = Path(member.filename)
-            if member_path.is_absolute() or ".." in member_path.parts:
-                raise RuntimeError(f"Unsafe zip member path: {member.filename}")
-            if "__MACOSX" in member_path.parts or member_path.name.startswith("._"):
-                continue
-            target = (dest_dir / member_path).resolve()
-            if not target.is_relative_to(dest_root):
-                raise RuntimeError(f"Zip slip detected for member: {member.filename}")
-            members.append(member)
-        archive.extractall(dest_dir, members=members)
-
-
-def ensure_cuva_annotations(
-    cache_dir: str | Path = DEFAULT_CACHE_DIR,
-) -> dict[str, Path]:
-    """Download CUVA parquet annotations without downloading video archives."""
-    cache_root = Path(cache_dir)
-    paths: dict[str, Path] = {}
-    for split, repo_path in PARQUET_FILES.items():
-        paths[split] = Path(
-            hf_hub_download(
-                repo_id=HF_REPO_ID,
-                repo_type="dataset",
-                filename=repo_path,
-                local_dir=str(cache_root),
-            )
-        )
-    return paths
-
-
-def ensure_cuva_videos(
-    cache_dir: str | Path = DEFAULT_CACHE_DIR,
-    groups: Sequence[int] | None = None,
-    force_extract: bool = False,
-) -> Path:
-    """Download and extract CUVA video groups (about 25.6 GB in total)."""
-    cache_root = Path(cache_dir)
-    video_root = cache_root / "videos"
-    selected = list(range(4)) if groups is None else list(groups)
-    invalid = [group for group in selected if group not in range(4)]
-    if invalid:
-        raise ValueError(f"CUVA video groups must be 0-3, got {invalid}")
-
-    for group in selected:
-        repo_path = VIDEO_ARCHIVES[group]
-        marker = video_root / f".group_{group}.extracted"
-        if marker.exists() and not force_extract:
-            continue
-        zip_path = Path(
-            hf_hub_download(
-                repo_id=HF_REPO_ID,
-                repo_type="dataset",
-                filename=repo_path,
-                local_dir=str(cache_root),
-            )
-        )
-        print(f"Extracting {zip_path.name} to {video_root} ...")
-        _safe_extract_zip(zip_path, video_root)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("ok\n", encoding="utf-8")
-    return video_root
-
-
-def load_cuva_samples(
-    split: str = "train",
-    cache_dir: str | Path = DEFAULT_CACHE_DIR,
-    tasks: Sequence[str] | None = None,
-) -> list[dict[str, str]]:
-    """Load CUVA rows and normalize them to question/answer video samples.
-
-    CUVA's ``full`` split contains both the original records and the records
-    from ``test``. Test videos also retain older rows under different IDs, so
-    the ``train`` alias removes every row whose ``visual_input`` occurs in
-    ``test`` to avoid video-level evaluation leakage.
-    """
-    if split not in VALID_SPLITS:
-        raise ValueError(f"Unknown split {split!r}; expected one of {sorted(VALID_SPLITS)}")
-
-    parquet = ensure_cuva_annotations(cache_dir)
-    source_split = "full" if split in {"train", "full"} else "test"
-    dataset = load_dataset(
-        "parquet",
-        data_files={source_split: str(parquet[source_split])},
-        split=source_split,
-    )
-
-    test_video_names: set[str] = set()
-    if split == "train":
-        test_dataset = load_dataset(
-            "parquet",
-            data_files={"test": str(parquet["test"])},
-            split="test",
-        )
-        test_video_names = {
-            Path(str(video_name)).name
-            for video_name in test_dataset["visual_input"]
-        }
-
-    allowed_tasks = (
-        {task.casefold() for task in tasks} if tasks is not None else None
-    )
-    samples: list[dict[str, str]] = []
-    for row in dataset:
-        row_id = str(row["ID"])
-        video_name = Path(str(row["visual_input"])).name
-        if video_name in test_video_names:
-            continue
-        raw_task = str(row["task"]).strip()
-        task = TASK_ALIASES.get(raw_task, raw_task)
-        if allowed_tasks is not None and task.casefold() not in allowed_tasks:
-            continue
-        question = str(row["instruction"]).strip()
-        answer = str(row["output"]).strip()
-        if not video_name or not question or not answer:
-            continue
-        samples.append(
-            {
-                "id": row_id,
-                "video_name": video_name,
-                "clip_id": Path(video_name).stem,
-                "question": question,
-                "answer": answer,
-                "qa_type": task,
-            }
-        )
-
-    if not samples:
-        raise RuntimeError(f"No CUVA samples found for split={split!r}")
-    return samples
 
 
 def build_video_index(video_root: str | Path) -> dict[str, Path]:
@@ -359,198 +200,22 @@ def load_video_frames(
         cap.release()
 
 
-class CUVADataset(Dataset):
-    def __init__(
-        self,
-        samples: list[dict[str, str]],
-        num_frames: int = DEFAULT_NUM_FRAMES,
-        img_size: int = IMG_SIZE,
-    ):
-        self.samples = samples
-        self.num_frames = num_frames
-        self.img_size = img_size
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> dict:
-        sample = self.samples[index]
-        return {
-            "video": load_video_frames(
-                sample["video_path"],
-                num_frames=self.num_frames,
-                img_size=self.img_size,
-            ),
-            "question": sample["question"],
-            "answer": sample["answer"],
-            "qa_type": sample["qa_type"],
-            "clip_id": sample["clip_id"],
-            "sample_id": sample["id"],
-            "video_path": sample["video_path"],
-        }
-
-
-def _pad_sequences(
-    sequences: list[list[int]],
-    pad_value: int,
-) -> torch.Tensor:
-    max_length = max(len(sequence) for sequence in sequences)
-    batch = torch.full((len(sequences), max_length), pad_value, dtype=torch.long)
-    for index, sequence in enumerate(sequences):
-        batch[index, : len(sequence)] = torch.tensor(sequence, dtype=torch.long)
-    return batch
-
-
-def _build_minicpm_batch(
-    batch,
-    tokenizer: PreTrainedTokenizer,
-    max_length: int,
+def build_caption_batch(
+    batch: list[dict],
+    tokenizer: Any,
+    max_length: int = 128,
 ) -> dict:
-    input_ids_list = []
-    labels_list = []
-    for item in batch:
-        input_ids, labels = tokenize_chat_pair(
-            tokenizer,
-            item["question"],
-            item["answer"],
-            max_length=max_length,
-        )
-        input_ids_list.append(input_ids)
-        labels_list.append(labels)
-
-    input_ids = _pad_sequences(input_ids_list, tokenizer.pad_token_id)
-    labels = _pad_sequences(labels_list, -100)
+    """Collate video + description using CaptionTokenizer (or any batch_encode API)."""
+    videos = torch.stack([item["video"] for item in batch])
+    texts = [item.get("answer") or item.get("description") or "" for item in batch]
+    encoded = tokenizer.batch_encode(texts, max_length=max_length)
     return {
-        "video": torch.stack([item["video"] for item in batch]),
-        "input_ids": input_ids,
-        "attention_mask": (input_ids != tokenizer.pad_token_id).long(),
-        "labels": labels,
-        "question": [item["question"] for item in batch],
-        "answer": [item["answer"] for item in batch],
-        "qa_type": [item["qa_type"] for item in batch],
-        "clip_id": [item["clip_id"] for item in batch],
-        "sample_id": [item["sample_id"] for item in batch],
+        "video": videos,
+        "input_ids": encoded["input_ids"],
+        "attention_mask": encoded["attention_mask"],
+        "question": [item.get("question", "") for item in batch],
+        "answer": texts,
+        "clip_id": [item.get("clip_id", "") for item in batch],
+        "sample_id": [item.get("sample_id", item.get("id", "")) for item in batch],
+        "video_path": [item.get("video_path", "") for item in batch],
     }
-
-
-def make_dataloader(
-    tokenizer: PreTrainedTokenizer,
-    video_root: str | Path | None = None,
-    split: str = "train",
-    cache_dir: str | Path = DEFAULT_CACHE_DIR,
-    download_videos: bool = False,
-    video_groups: Sequence[int] | None = None,
-    num_frames: int = DEFAULT_NUM_FRAMES,
-    img_size: int = IMG_SIZE,
-    max_length: int = 256,
-    batch_size: int = 2,
-    shuffle: bool = False,
-    num_workers: int = 0,
-    pin_memory: bool | None = None,
-    tasks: Sequence[str] | None = None,
-    skip_missing: bool = False,
-) -> tuple[DataLoader, int]:
-    if download_videos:
-        downloaded_root = ensure_cuva_videos(cache_dir, groups=video_groups)
-        if video_root is None:
-            video_root = downloaded_root
-    if video_root is None:
-        video_root = Path(cache_dir) / "videos"
-
-    samples = load_cuva_samples(split, cache_dir=cache_dir, tasks=tasks)
-    samples = resolve_samples_to_videos(
-        samples,
-        build_video_index(video_root),
-        skip_missing=skip_missing,
-    )
-    dataset = CUVADataset(samples, num_frames=num_frames, img_size=img_size)
-
-    def collate_fn(batch):
-        return _build_minicpm_batch(batch, tokenizer, max_length)
-
-    if pin_memory is None:
-        pin_memory = torch.cuda.is_available()
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory,
-        drop_last=split == "train",
-    )
-    return loader, len(loader)
-
-
-def encode_user_prompt(
-    tokenizer: PreTrainedTokenizer,
-    questions: list[str],
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    input_ids_list = []
-    for question in questions:
-        input_ids_list.append(
-            apply_chat(
-                tokenizer,
-                [{"role": "user", "content": question}],
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors=None,
-            )
-        )
-    input_ids = _pad_sequences(input_ids_list, tokenizer.pad_token_id).to(device)
-    return {
-        "input_ids": input_ids,
-        "attention_mask": (input_ids != tokenizer.pad_token_id).long(),
-    }
-
-
-def _parse_groups(value: str | None) -> list[int] | None:
-    if not value:
-        return None
-    return [int(group.strip()) for group in value.split(",") if group.strip()]
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Download or inspect CUVA")
-    parser.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--split", choices=sorted(VALID_SPLITS), default="train")
-    parser.add_argument(
-        "--download-videos",
-        action="store_true",
-        help="Download and extract the selected 7.5 GB CUVA video groups",
-    )
-    parser.add_argument(
-        "--groups",
-        default=None,
-        help="Comma-separated archive groups (0-3); default downloads all",
-    )
-    parser.add_argument(
-        "--annotations-only",
-        action="store_true",
-        help="Download/inspect annotations without requiring videos",
-    )
-    args = parser.parse_args()
-
-    samples = load_cuva_samples(args.split, cache_dir=args.cache_dir)
-    print(f"CUVA {args.split} rows: {len(samples)}")
-    print(
-        "Example:",
-        {
-            key: samples[0][key]
-            for key in ("id", "video_name", "qa_type", "question", "answer")
-        },
-    )
-    if args.download_videos:
-        root = ensure_cuva_videos(
-            args.cache_dir,
-            groups=_parse_groups(args.groups),
-        )
-        print(f"Videos extracted under: {root}")
-    elif not args.annotations_only:
-        print(
-            "Annotations are ready. Add --download-videos to download the "
-            "~25.6 GB video archives, optionally with --groups 0."
-        )

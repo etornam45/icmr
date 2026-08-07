@@ -17,13 +17,12 @@ import torch
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from torch.utils.data import DataLoader, Dataset
-from transformers import PreTrainedTokenizer
 
-from heads.vqa.dataset import (
+from heads.caption.dataset import (
     DEFAULT_NUM_FRAMES,
     IMG_SIZE,
     VIDEO_EXTENSIONS,
-    _build_minicpm_batch,
+    build_caption_batch,
     build_video_index,
     load_video_frames,
     resolve_samples_to_videos,
@@ -452,7 +451,7 @@ def resolve_vau_samples(
     skip_missing: bool = False,
 ) -> list[dict]:
     """Resolve VAU-Bench video filenames under ``video_root``."""
-    # Reuse CUVA resolver; it only needs video_name keys.
+    # Reuse shared video-name resolver; it only needs video_name keys.
     return resolve_samples_to_videos(
         samples,
         build_video_index(video_root),
@@ -586,13 +585,13 @@ class VAUClassDataset(Dataset):
 
 
 def make_vau_caption_dataloader(
-    tokenizer: PreTrainedTokenizer,
+    tokenizer,
     video_root: str | Path | None = None,
     split: str = "train",
     cache_dir: str | Path = DEFAULT_CACHE_DIR,
     num_frames: int = DEFAULT_NUM_FRAMES,
     img_size: int = IMG_SIZE,
-    max_length: int = 256,
+    max_length: int = 128,
     batch_size: int = 2,
     shuffle: bool = False,
     num_workers: int = 0,
@@ -610,7 +609,7 @@ def make_vau_caption_dataloader(
     dataset = VAUCaptionDataset(samples, num_frames=num_frames, img_size=img_size)
 
     def collate_fn(batch):
-        return _build_minicpm_batch(batch, tokenizer, max_length)
+        return build_caption_batch(batch, tokenizer, max_length)
 
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
@@ -874,6 +873,6 @@ if __name__ == "__main__":
         if not args.annotations_only:
             print(
                 "Annotations are ready. For a disk-friendly UCF download (~57 GB):\n"
-                "  python -m heads.vqa.vau_dataset --download-ucf --vau-only\n"
+                "  python -m heads.caption.vau_dataset --download-ucf --vau-only\n"
                 "Then verify with --verify-videos --sources ucf."
             )

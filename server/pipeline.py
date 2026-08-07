@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from heads.anomaly.inference import predict_from_cls
+from heads.anomaly.inference import predict_from_patches
 from heads.detr.dataset import letterbox
 from heads.detr.predict import detect_from_patches
 from server.config import ServerConfig
@@ -102,28 +102,18 @@ def run_pipeline(
     segment: dict[str, Any] | None = None
     svdd_score: float | None = None
 
-    if window_start_ts is not None and window_end_ts is not None:
-        window_duration = max(window_end_ts - window_start_ts, 1e-3)
-    else:
-        window_duration = float(cfg.buffer_seconds)
-
     if runtime.has_anomaly:
-        result = predict_from_cls(
+        result = predict_from_patches(
             runtime.anomaly,
-            features["cls_tokens"],
+            features["patch_tokens"],
             runtime.anomaly_id2label,
             top_k=5,
-            window_duration=window_duration,
-            nms_sigma=cfg.nms_sigma,
-            deploy_threshold=0.0,  # gate in is_anomaly_event
         )
         anomaly_class = result["prediction"]
         anomaly_score = float(result["score"])
         top_k = result["top_k"]
         segments = list(result.get("segments") or [])
         segment = result.get("segment")
-        if result.get("svdd_distance") is not None:
-            svdd_score = float(result["svdd_distance"])
 
     jpegs = render_all_previews(
         preview_bgr,

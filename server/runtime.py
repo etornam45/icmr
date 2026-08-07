@@ -1,4 +1,4 @@
-"""Shared DINOv3 runtime with DETR, anomaly, and optional VQA heads."""
+"""Shared DINOv3 runtime with DETR, anomaly, and optional caption heads."""
 
 from __future__ import annotations
 
@@ -10,25 +10,25 @@ from typing import Any
 import torch
 from torch import nn
 
-from dinov3.checkpoints.load import ensure_backbone_checkpoint, load_checkpoint
-from dinov3.models import vit_small
 from dinov3.utils.device import get_device
 from heads.anomaly.inference import (
     load_anomaly_label_maps,
     resolve_anomaly_checkpoint,
 )
 from heads.anomaly.model import (
-    DINOv3AnomalyLocalizer,
+    AnomalyClassifier,
     build_anomaly_model,
     load_anomaly_checkpoint,
 )
-from heads.detr.transformer import build_detr
-from heads.vqa.inference import resolve_vqa_checkpoint
-from heads.vqa.model import (
-    DINOv3QwenXAttn,
-    build_hybrid_model,
-    load_hybrid_checkpoint,
+from heads.backbone import build_backbone, encode_frames
+from heads.caption.inference import resolve_caption_checkpoint
+from heads.caption.model import (
+    CaptionHead,
+    build_caption_model,
+    load_caption_checkpoint,
 )
+from heads.caption.tokenizer import DEFAULT_TOKENIZER_DIR, ensure_tokenizer
+from heads.detr.transformer import build_detr
 from server.config import ServerConfig
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,11 @@ class ModelRuntime:
     device: torch.device
     backbone: nn.Module
     detr: nn.Module
-    anomaly: DINOv3AnomalyLocalizer | None = None
+    anomaly: AnomalyClassifier | None = None
     anomaly_id2label: dict[int, str] = field(default_factory=dict)
-    vqa: DINOv3QwenXAttn | None = None
-    vqa_tokenizer: Any = None
-    vqa_num_frames: int = 16
+    caption: CaptionHead | None = None
+    caption_tokenizer: Any = None
+    caption_num_frames: int = 16
     config: ServerConfig | None = None
 
     @property
@@ -51,24 +51,25 @@ class ModelRuntime:
         return self.anomaly is not None and bool(self.anomaly_id2label)
 
     @property
+    def has_caption(self) -> bool:
+        return self.caption is not None and self.caption_tokenizer is not None
+
+    # Back-compat aliases used by older call sites.
+    @property
+    def vqa(self):
+        return self.caption
+
+    @property
+    def vqa_tokenizer(self):
+        return self.caption_tokenizer
+
+    @property
+    def vqa_num_frames(self) -> int:
+        return self.caption_num_frames
+
+    @property
     def has_vqa(self) -> bool:
-        return self.vqa is not None and self.vqa_tokenizer is not None
-
-
-def _build_backbone(weights: str, device: torch.device) -> nn.Module:
-    vision = vit_small(
-        patch_size=16,
-        n_storage_tokens=4,
-        layerscale_init=1e-5,
-        mask_k_bias=True,
-    )
-    weights = ensure_backbone_checkpoint(weights)
-    load_checkpoint(vision, weights)
-    vision.to(device)
-    vision.eval()
-    for param in vision.parameters():
-        param.requires_grad = False
-    return vision
+        return self.has_caption
 
 
 def _load_detr(checkpoint: str, device: torch.device) -> nn.Module:
@@ -87,69 +88,71 @@ def _load_detr(checkpoint: str, device: torch.device) -> nn.Module:
     return detr
 
 
-def _resolve_vqa_dir(cfg: ServerConfig) -> Path | None:
-    primary = resolve_vqa_checkpoint(cfg.vqa_checkpoint)
+def _resolve_caption_dir(cfg: ServerConfig) -> Path | None:
+    primary = resolve_caption_checkpoint(cfg.caption_checkpoint)
     if primary.exists():
         return primary
-    fallback = resolve_vqa_checkpoint(cfg.vqa_fallback_checkpoint)
+    fallback = resolve_caption_checkpoint(cfg.caption_fallback_checkpoint)
     if fallback.exists():
         logger.warning(
-            "VQA checkpoint %s missing; using fallback %s",
-            cfg.vqa_checkpoint,
+            "Caption checkpoint %s missing; using fallback %s",
+            cfg.caption_checkpoint,
             fallback,
         )
         return fallback
     return None
 
 
-def _peek_vqa_num_frames(checkpoint_dir: Path, default: int) -> int:
-    visual_path = checkpoint_dir / "visual_head.pt"
-    legacy_path = checkpoint_dir / "vision_adapter.pt"
-    path = visual_path if visual_path.exists() else legacy_path
-    if not path.exists():
+def _peek_caption_num_frames(checkpoint_dir: Path, default: int) -> int:
+    ckpt_path = checkpoint_dir / "caption_head.pt"
+    if not ckpt_path.exists():
         return default
     try:
-        state = torch.load(path, map_location="cpu", weights_only=True)
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         frames = state.get("num_frames")
         if frames is not None:
             return int(frames)
     except Exception:
-        logger.exception("Could not read num_frames from %s", path)
+        logger.exception("Could not read num_frames from %s", ckpt_path)
     return default
+
+
+def _peek_tokenizer_dir(checkpoint_dir: Path, cfg: ServerConfig) -> str:
+    ckpt_path = checkpoint_dir / "caption_head.pt"
+    if ckpt_path.exists():
+        try:
+            state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            tok_dir = state.get("tokenizer_dir")
+            if tok_dir:
+                return str(tok_dir)
+        except Exception:
+            logger.exception("Could not read tokenizer_dir from %s", ckpt_path)
+    return cfg.caption_tokenizer_dir or DEFAULT_TOKENIZER_DIR
 
 
 def load_runtime(cfg: ServerConfig) -> ModelRuntime:
     device = get_device()
     logger.info("Loading shared DINOv3 backbone on %s", device)
-    backbone = _build_backbone(cfg.backbone_weights, device)
+    backbone = build_backbone(device, weights=cfg.backbone_weights)
 
     logger.info("Loading DETR decoder from %s", cfg.detr_checkpoint)
     detr = _load_detr(cfg.detr_checkpoint, device)
 
-    anomaly: DINOv3AnomalyLocalizer | None = None
+    anomaly: AnomalyClassifier | None = None
     id2label: dict[int, str] = {}
     anomaly_path = resolve_anomaly_checkpoint(cfg.anomaly_checkpoint)
     if anomaly_path.exists():
         try:
             label2id, id2label = load_anomaly_label_maps(anomaly_path)
-            normal_index = next(
-                (
-                    label2id[k]
-                    for k in ("Normal", "normal", "Normal_Videos")
-                    if k in label2id
-                ),
-                0,
-            )
             anomaly = build_anomaly_model(
                 device,
                 num_classes=len(label2id),
-                vision_model=backbone,
-                normal_index=normal_index,
+                num_frames=cfg.num_frames,
             )
             load_anomaly_checkpoint(anomaly, anomaly_path, device)
             anomaly.eval()
             logger.info(
-                "Anomaly WTAL head loaded (%d classes) from %s",
+                "Anomaly head loaded (%d classes) from %s",
                 len(label2id),
                 anomaly_path,
             )
@@ -160,40 +163,45 @@ def load_runtime(cfg: ServerConfig) -> ModelRuntime:
     else:
         logger.warning(
             "Anomaly checkpoint not found at %s — live anomaly scores and "
-            "auto VQA captions are disabled until it exists",
+            "auto captions are disabled until it exists",
             cfg.anomaly_checkpoint,
         )
 
-    vqa: DINOv3QwenXAttn | None = None
+    caption: CaptionHead | None = None
     tokenizer = None
-    vqa_num_frames = cfg.num_frames
-    if cfg.load_vqa:
-        vqa_dir = _resolve_vqa_dir(cfg)
-        if vqa_dir is not None:
+    caption_num_frames = cfg.num_frames
+    if cfg.load_caption:
+        caption_dir = _resolve_caption_dir(cfg)
+        if caption_dir is not None:
             try:
-                vqa_num_frames = _peek_vqa_num_frames(vqa_dir, cfg.num_frames)
+                caption_num_frames = _peek_caption_num_frames(
+                    caption_dir, cfg.num_frames
+                )
+                tok_dir = _peek_tokenizer_dir(caption_dir, cfg)
                 logger.info(
-                    "Loading VQA head from %s (num_frames=%d; this may take a while)",
-                    vqa_dir,
-                    vqa_num_frames,
+                    "Loading caption head from %s (num_frames=%d)",
+                    caption_dir,
+                    caption_num_frames,
                 )
-                vqa, tokenizer = build_hybrid_model(
+                tokenizer = ensure_tokenizer(tok_dir)
+                caption = build_caption_model(
                     device,
-                    num_frames=vqa_num_frames,
-                    vision_model=backbone,
+                    vocab_size=tokenizer.vocab_size,
+                    num_frames=caption_num_frames,
+                    pad_token_id=tokenizer.pad_token_id,
                 )
-                load_hybrid_checkpoint(
-                    vqa, str(vqa_dir), device, trainable_adapter=False
-                )
-                vqa.eval()
-                logger.info("VQA head ready")
+                load_caption_checkpoint(caption, caption_dir, device)
+                caption.eval()
+                logger.info("Caption head ready")
             except Exception:
-                logger.exception("Failed to load VQA head; continuing without captions")
-                vqa = None
+                logger.exception(
+                    "Failed to load caption head; continuing without captions"
+                )
+                caption = None
                 tokenizer = None
-                vqa_num_frames = cfg.num_frames
+                caption_num_frames = cfg.num_frames
         else:
-            logger.warning("No VQA checkpoint found; captions disabled")
+            logger.warning("No caption checkpoint found; captions disabled")
 
     return ModelRuntime(
         device=device,
@@ -201,9 +209,9 @@ def load_runtime(cfg: ServerConfig) -> ModelRuntime:
         detr=detr,
         anomaly=anomaly,
         anomaly_id2label=id2label,
-        vqa=vqa,
-        vqa_tokenizer=tokenizer,
-        vqa_num_frames=vqa_num_frames,
+        caption=caption,
+        caption_tokenizer=tokenizer,
+        caption_num_frames=caption_num_frames,
         config=cfg,
     )
 
@@ -213,28 +221,5 @@ def encode_video_window(
     runtime: ModelRuntime,
     videos: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """
-    Single shared backbone forward over a video window.
-
-    Args:
-        videos: [B, T, 3, H, W] on runtime.device
-
-    Returns:
-        cls_tokens: [B, T, D]
-        patch_tokens: [B, T, N, D]
-        last_patches: [B, N, D]
-    """
-    if videos.dim() == 4:
-        videos = videos.unsqueeze(0)
-    batch, num_frames, channels, height, width = videos.shape
-    flat = videos.reshape(batch * num_frames, channels, height, width)
-    features = runtime.backbone(flat, masks=None, is_training=True)
-    cls = features["x_norm_clstoken"].view(batch, num_frames, -1)
-    patches = features["x_norm_patchtokens"]
-    n_patches = patches.shape[1]
-    patches = patches.view(batch, num_frames, n_patches, -1)
-    return {
-        "cls_tokens": cls,
-        "patch_tokens": patches,
-        "last_patches": patches[:, -1],
-    }
+    """Single shared backbone forward over a video window."""
+    return encode_frames(runtime.backbone, videos)

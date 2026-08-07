@@ -51,18 +51,17 @@ are JSON, so heads can log different fields without schema changes.
 
 ## Training integrations
 
-### VQA
+### Caption
 
 ```bash
-python -m heads.vqa.train \
+python -m heads.caption.train \
   --skip-missing-videos \
-  --log-db logs/vqa.db \
-  --run-name cuva-baseline \
+  --log-db logs/caption.db \
+  --run-name vau-caption \
   --epochs 5
 ```
 
-Logs per epoch: `train/loss`, `eval/loss`, and `eval_sample` records with
-`question` / `reference` / `prediction`.
+Logs per epoch: `train/loss`, `eval/loss`.
 
 ### DETR
 

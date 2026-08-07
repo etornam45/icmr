@@ -15,13 +15,13 @@ Architecture (`ARCHITECTURE = patch_transformer_v1`):
 
 ## Dataset setup
 
-Same UCF staging as VQA — annotations from VAU-Bench, videos from
+Same UCF staging as caption — annotations from VAU-Bench, videos from
 [`etornam/ufc-crime-videos`](https://huggingface.co/datasets/etornam/ufc-crime-videos):
 
 ```bash
-python -m heads.vqa.vau_dataset --annotations-only --split train
-python -m heads.vqa.vau_dataset --download-ucf --vau-only
-python -m heads.vqa.vau_dataset --verify-videos --sources ucf --split train
+python -m heads.caption.vau_dataset --annotations-only --split train
+python -m heads.caption.vau_dataset --download-ucf --vau-only
+python -m heads.caption.vau_dataset --verify-videos --sources ucf --split train
 ```
 
 Training defaults to `--sources ucf`.

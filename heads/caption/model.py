@@ -7,6 +7,7 @@ The backbone in ``heads.backbone`` encodes frames; this module consumes
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -216,6 +217,62 @@ def build_caption_model(
         vocab_size=vocab_size,
         pad_token_id=pad_token_id,
     ).to(device)
+
+
+def save_caption_checkpoint(
+    model: CaptionHead,
+    checkpoint_dir: str | Path,
+    tokenizer_dir: str | Path | None = None,
+) -> None:
+    """Save ``caption_head.pt`` with architecture, weights, and hyperparams."""
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "architecture": model.architecture,
+        "state_dict": model.state_dict(),
+        "d_model": model.d_model,
+        "vision_dim": model.vision_dim,
+        "num_frames": model.num_frames,
+        "patches_per_frame": model.patches_per_frame,
+        "vocab_size": model.vocab_size,
+        "max_text_len": model.max_text_len,
+        "pad_token_id": model.pad_token_id,
+    }
+    if tokenizer_dir is not None:
+        payload["tokenizer_dir"] = str(tokenizer_dir)
+    torch.save(payload, path / "caption_head.pt")
+
+
+def load_caption_checkpoint(
+    model: CaptionHead,
+    checkpoint_dir: str | Path,
+    device: torch.device,
+) -> None:
+    """Load ``caption_head.pt`` into an already-built ``CaptionHead``."""
+    path = Path(checkpoint_dir)
+    ckpt_path = path / "caption_head.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"No caption checkpoint at {ckpt_path}")
+
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    arch = state.get("architecture")
+    if arch is not None and arch != ARCHITECTURE:
+        raise RuntimeError(
+            f"Checkpoint architecture={arch!r} is incompatible with "
+            f"{ARCHITECTURE!r}. Retrain with heads.caption.train."
+        )
+    if int(state.get("vocab_size", model.vocab_size)) != model.vocab_size:
+        raise RuntimeError(
+            f"Checkpoint vocab_size={state.get('vocab_size')} does not match "
+            f"model vocab_size={model.vocab_size}"
+        )
+    if int(state.get("num_frames", model.num_frames)) != model.num_frames:
+        raise RuntimeError(
+            f"Checkpoint num_frames={state.get('num_frames')} does not match "
+            f"model num_frames={model.num_frames}"
+        )
+    model.load_state_dict(state["state_dict"])
+    model.to(device)
 
 
 if __name__ == "__main__":
