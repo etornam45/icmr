@@ -106,7 +106,7 @@ COCO_CLASSES = [
 ]
 
 
-def run_inference(image_path="test/test5.jpeg", threshold=0.62):
+def run_inference(image_path="test/test5.jpeg", threshold=0.7):
     device = get_device()
 
     dinov3_small = vit_small(
@@ -124,9 +124,11 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
 
     detr_decoder = build_detr(
         d_model=384,
-        num_layers=4,
+        num_layers=6,
         n_classes=92,
-        n_points=5,
+        n_heads=8,
+        n_queries=50,
+        n_points=4,
     ).to(device)
     detr_decoder.load_state_dict(
         torch.load(
@@ -169,7 +171,7 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
         ph = h * img_size
 
         rect = patches.Rectangle(
-            (x, y), pw, ph, linewidth=2, edgecolor="red", facecolor="none", alpha=0.9
+            (x, y), pw, ph, linewidth=1, edgecolor="red", facecolor="none", alpha=0.9
         )
         ax.add_patch(rect)
 
@@ -192,4 +194,4 @@ def run_inference(image_path="test/test5.jpeg", threshold=0.62):
 
 
 if __name__ == "__main__":
-    run_inference(image_path="1900-151662242_tiny.jpg")
+    run_inference(image_path="1900-151662242_tiny.jpg", threshold=0.8)
